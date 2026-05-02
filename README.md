@@ -1,6 +1,6 @@
 # AutopilotSBC
 
-AutopilotSBC is a browser extension for the EA SPORTS FC Ultimate Team Web App.
+[AutopilotSBC](https://autopilotsbc.vercel.app/) is a browser extension for the EA SPORTS FC Ultimate Team Web App.
 
 It started as a way to make SBC solving faster, less repetitive, and a lot more controllable.
 
@@ -10,7 +10,7 @@ This repository is the extension itself.
 
 ## What It Does
 
-AutopilotSBC has a few different solver flows depending on what you are trying to do:
+[AutopilotSBC](https://autopilotsbc.vercel.app/) has a few different solver flows depending on what you are trying to do:
 
 - `Solve Squad` for a normal one-off challenge
 - `Multi` for repeating the same SBC several times
@@ -25,7 +25,7 @@ The main install source is now the Chrome Web Store.
 
 ### Chrome Web Store
 
-Install AutopilotSBC from the [Chrome Web Store](https://chromewebstore.google.com/detail/autopilotsbc-fc26-sbc-sol/gkcjhdebgfhdbkecahbnpmcaobapcfbh?hl=en).
+Install [AutopilotSBC](https://autopilotsbc.vercel.app/) from the [Chrome Web Store](https://chromewebstore.google.com/detail/autopilotsbc-fc26-sbc-sol/gkcjhdebgfhdbkecahbnpmcaobapcfbh?hl=en).
 
 After installing, open the FC Web App and refresh the page if it was already open.
 
