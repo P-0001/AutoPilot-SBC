@@ -671,6 +671,7 @@ const FULL_SQUAD_EXACT_TYPES = new Set([
   "player_quality",
   "player_rarity",
   "player_rarity_group",
+  "player_rarity_or_totw",
   "player_tots",
   "player_totw_or_tots",
   "player_tradability",
@@ -868,9 +869,7 @@ const buildPredicate = (rule) => {
   const values = rule.values || [];
   const type = rule.type;
   if (type === "player_quality" || type === "player_level") {
-    const normalized = values.map(normalizeQualityValue).filter(Boolean);
-    if (!normalized.length) return null;
-    return (player) => normalized.includes(player.quality);
+    return buildQualityGatePredicate(rule);
   }
   if (type === "player_totw_or_tots") {
     return (player) => isTotwOrTotsPlayer(player);
@@ -1360,6 +1359,7 @@ const PREFILL_PREFERENCE_TYPES = new Set([
   "player_quality",
   "player_rarity",
   "player_rarity_group",
+  "player_rarity_or_totw",
   "player_tots",
   "player_totw_or_tots",
   "player_tradability",
@@ -1817,6 +1817,12 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
     cap.count = countMatching(working, cap.predicate);
   }
 
+  const preferencePredicates = Array.isArray(options?.preferencePredicates)
+    ? options.preferencePredicates.filter(
+        (entry) => entry && typeof entry.predicate === "function",
+      )
+    : [];
+
   const canAddSameMax = (candidate) => {
     for (const entry of sameState) {
       const value = candidate?.[entry.attr];
@@ -1848,6 +1854,16 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
     return { ok: true, penalty };
   };
 
+  const getPreferenceScore = (candidate) => {
+    let score = 0;
+    for (const entry of preferencePredicates) {
+      if (entry.predicate(candidate)) {
+        score += Math.max(1, toNumber(entry.weight) ?? 1);
+      }
+    }
+    return score;
+  };
+
   while (working.length < target) {
     let best = null;
     for (const candidate of pool || []) {
@@ -1855,6 +1871,7 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
       if (lockedIds.has(candidate.id)) continue;
       const check = canAddCandidate(candidate);
       if (!check.ok) continue;
+      const preferenceScore = getPreferenceScore(candidate);
       const distance = useRatingHint
         ? Math.abs((toNumber(candidate?.rating) ?? 0) - ratingHintPivot)
         : null;
@@ -1862,6 +1879,9 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
         !best ||
         check.penalty < best.penalty ||
         (check.penalty === best.penalty &&
+          preferenceScore > best.preferenceScore) ||
+        (check.penalty === best.penalty &&
+          preferenceScore === best.preferenceScore &&
           (useRatingHint
             ? distance < best.distance ||
               (distance === best.distance &&
@@ -1871,6 +1891,7 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
         best = {
           player: candidate,
           penalty: check.penalty,
+          preferenceScore,
           distance: distance ?? 0,
         };
       }
@@ -1899,7 +1920,16 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
       .filter((player) => player && player.id != null)
       .filter((player) => !lockedIds.has(player.id))
       .slice()
-      .sort((a, b) => a.rating - b.rating);
+      .sort((a, b) => {
+        const preferenceDiff = getPreferenceScore(b) - getPreferenceScore(a);
+        if (preferenceDiff !== 0) return preferenceDiff;
+        if (useRatingHint) {
+          const aDistance = Math.abs((toNumber(a?.rating) ?? 0) - ratingHintPivot);
+          const bDistance = Math.abs((toNumber(b?.rating) ?? 0) - ratingHintPivot);
+          if (aDistance !== bDistance) return aDistance - bDistance;
+        }
+        return a.rating - b.rating;
+      });
     for (const player of remaining) {
       if (working.length >= target) break;
       if (!player || player.id == null) continue;
@@ -7422,11 +7452,18 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       return (a?.isSpecial ? 1 : 0) - (b?.isSpecial ? 1 : 0);
     });
 
+    const fillPreferencePredicates = buildPrefillPreferencePredicates(
+      rules,
+      squad,
+      squadSize,
+    );
+
     squad = fillSquad(squad, pool, squadSize, lockedIds, {
       uniqueMaxByAttr,
       sameMaxByAttr,
       predicateCaps,
       ratingHint: ratingFillHint,
+      preferencePredicates: fillPreferencePredicates,
     });
     rebuildLockedIdsFromSquad(squad, lockedIds);
     debugPush?.({
