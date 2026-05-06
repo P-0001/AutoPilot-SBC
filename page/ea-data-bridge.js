@@ -4331,6 +4331,18 @@
       .toLowerCase();
   };
 
+  const deriveGeoRegionKeyFromLabel = (label) => {
+    if (!label) return null;
+    const text = String(label).toLowerCase();
+    if (text.includes("players from africa")) return "africa";
+    if (text.includes("players from europe")) return "europe";
+    if (text.includes("players from asia")) return "asia";
+    if (text.includes("players from south america")) return "south_america";
+    if (text.includes("players from north america")) return "north_america";
+    if (text.includes("players from oceania")) return "oceania";
+    return null;
+  };
+
   const deriveTypeFromLabel = (label) => {
     if (!label) return null;
     const text = String(label).toLowerCase();
@@ -4358,6 +4370,7 @@
     ) {
       return "players_same_nation";
     }
+    if (deriveGeoRegionKeyFromLabel(text)) return "player_geo_region";
     if (text.includes("player quality")) return "player_quality";
     if (text.includes("player level")) return "player_level";
     if (text.includes("tots") || text.includes("team of the season")) {
@@ -4715,39 +4728,47 @@
           normalizeKeyName(keyName) ?? `key_${keyNumber}`;
         const normalizedValue = normalizeKvValue(value);
         const labelType = deriveTypeFromLabel(label);
+        const geoRegionKey = deriveGeoRegionKeyFromLabel(label);
         const numericValues =
           typeof normalizedValue === "number"
             ? [normalizedValue]
             : Array.isArray(normalizedValue)
               ? normalizedValue.filter((item) => typeof item === "number")
               : [];
-        const specialRarityOverride =
+        const specialKey25Override =
           keyNameNormalized === "player_rarity_group" &&
-          (labelType === "player_totw_or_tots" ||
+          (geoRegionKey ||
+            labelType === "player_totw_or_tots" ||
             labelType === "player_tots" ||
             numericValues.includes(44))
-            ? labelType === "player_tots"
-              ? "player_tots"
-              : "player_totw_or_tots"
+            ? geoRegionKey
+              ? "player_geo_region"
+              : labelType === "player_tots"
+                ? "player_tots"
+                : "player_totw_or_tots"
             : null;
         const type =
           keyNumber === -1
             ? "players_in_squad"
-            : specialRarityOverride
-              ? specialRarityOverride
+            : specialKey25Override
+              ? specialKey25Override
               : keyNameNormalized.startsWith("key_") && labelType
                 ? labelType
                 : keyNameNormalized;
+        const normalizedRuleValue =
+          specialKey25Override === "player_geo_region" && geoRegionKey
+            ? [geoRegionKey]
+            : normalizedValue;
         const derivedCount = (() => {
           if (count !== -1) return null;
           if (!DERIVED_COUNT_ALLOWED_TYPES.has(type)) return null;
-          if (typeof normalizedValue === "number") return normalizedValue;
+          if (typeof normalizedRuleValue === "number") return normalizedRuleValue;
           if (
-            Array.isArray(normalizedValue) &&
-            normalizedValue.length === 1 &&
-            typeof normalizedValue[0] === "number"
+            Array.isArray(normalizedRuleValue) &&
+            normalizedRuleValue.length === 1 &&
+            typeof normalizedRuleValue[0] === "number"
           ) {
-            return normalizedValue[0];
+            return normalizedRuleValue[0];
           }
           return null;
         })();
@@ -4775,7 +4796,7 @@
           op,
           count,
           derivedCount,
-          value: normalizedValue,
+          value: normalizedRuleValue,
           scope,
           scopeName,
           label,
@@ -19945,6 +19966,7 @@
       ...(extra && typeof extra === "object" ? extra : {}),
       debugEnabled: stats?.debugEnabled ?? null,
       solverVersion: stats?.solverVersion ?? null,
+      storageUsage: stats?.storageUsage ?? null,
       debugLogLength: stats?.debugLog?.length ?? 0,
     });
     if (stats?.orchestration) {
@@ -25826,7 +25848,7 @@
         prioritize: {
           duplicates: true,
           untradeables: true,
-          storage: false,
+          storage: true,
         },
         filters: {
           onlyDuplicates: false,

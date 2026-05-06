@@ -6,6 +6,7 @@ export const REQUIREMENT_KEYS = [
   "player_quality",
   "player_rarity",
   "player_rarity_group",
+  "player_geo_region",
   "player_tots",
   "player_totw_or_tots",
   "player_rarity_or_totw",
@@ -48,6 +49,7 @@ const TYPE_ALIASES = {
   player_quality: "player_quality",
   player_rarity: "player_rarity",
   player_rarity_group: "player_rarity_group",
+  player_geo_region: "player_geo_region",
   player_tots: "player_tots",
   player_totw_or_tots: "player_totw_or_tots",
   player_rarity_or_totw: "player_rarity_or_totw",
@@ -113,6 +115,7 @@ const CATEGORY_BY_TYPE = {
   player_quality: "player_tier_or_quality",
   player_rarity: "special_or_rarity",
   player_rarity_group: "special_or_rarity",
+  player_geo_region: "identity_quota",
   player_tots: "special_or_rarity",
   player_totw_or_tots: "special_or_rarity",
   player_rarity_or_totw: "special_or_rarity",
@@ -221,6 +224,19 @@ const scopeNameToOp = (scopeName) => {
   return null;
 };
 
+const deriveGeoRegionKeyFromLabel = (label) => {
+  if (!label) return null;
+  const normalized = normalizeString(label);
+  if (!normalized) return null;
+  if (normalized.includes("players from africa")) return "africa";
+  if (normalized.includes("players from europe")) return "europe";
+  if (normalized.includes("players from asia")) return "asia";
+  if (normalized.includes("players from south america")) return "south_america";
+  if (normalized.includes("players from north america")) return "north_america";
+  if (normalized.includes("players from oceania")) return "oceania";
+  return null;
+};
+
 export const normalizeRequirementType = (rule) => {
   if (!rule) return null;
   const rawType = normalizeString(rule.type);
@@ -232,6 +248,8 @@ export const normalizeRequirementType = (rule) => {
   const isRarityGroup =
     rawType === "player_rarity_group" || keyName === "player_rarity_group";
   if (isRarityGroup) {
+    const geoRegionKey = deriveGeoRegionKeyFromLabel(label);
+    if (geoRegionKey) return "player_geo_region";
     const hasTots =
       Boolean(label?.includes("tots")) ||
       Boolean(label?.includes("team of the season"));
@@ -265,6 +283,10 @@ export const normalizeRequirementType = (rule) => {
 const deriveValuesFromLabel = (rule, fallback = []) => {
   const label = normalizeString(rule?.label || rule?.raw?.label);
   if (!label) return fallback;
+  if (rule?.type === "player_geo_region") {
+    const geoRegionKey = deriveGeoRegionKeyFromLabel(label);
+    if (geoRegionKey) return [geoRegionKey];
+  }
   if (rule?.type === "player_quality" || rule?.type === "player_level") {
     if (label.includes("gold")) return ["gold"];
     if (label.includes("silver")) return ["silver"];

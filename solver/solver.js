@@ -15,6 +15,7 @@ const REQUIREMENT_KEYS = [
   "player_quality",
   "player_rarity",
   "player_rarity_group",
+  "player_geo_region",
   "player_tots",
   "player_totw_or_tots",
   "player_rarity_or_totw",
@@ -57,6 +58,7 @@ const TYPE_ALIASES = {
   player_quality: "player_quality",
   player_rarity: "player_rarity",
   player_rarity_group: "player_rarity_group",
+  player_geo_region: "player_geo_region",
   player_tots: "player_tots",
   player_totw_or_tots: "player_totw_or_tots",
   player_rarity_or_totw: "player_rarity_or_totw",
@@ -119,6 +121,7 @@ const FILTER_PRIORITY = [
   "nation_id",
   "league_id",
   "club_id",
+  "player_geo_region",
   "same_nation_count",
   "same_league_count",
   "same_club_count",
@@ -216,6 +219,8 @@ const normalizeRequirementType = (rule) => {
   const isRarityGroup =
     rawType === "player_rarity_group" || keyName === "player_rarity_group";
   if (isRarityGroup) {
+    const geoRegionKey = deriveGeoRegionKeyFromLabel(label);
+    if (geoRegionKey) return "player_geo_region";
     const hasTots =
       Boolean(label?.includes("tots")) ||
       Boolean(label?.includes("team of the season"));
@@ -245,6 +250,42 @@ const normalizeRequirementType = (rule) => {
   if (label.includes("untrade")) return "player_tradability";
   return null;
 };
+
+const deriveGeoRegionKeyFromLabel = (label) => {
+  if (!label) return null;
+  const text = normalizeString(label);
+  if (!text) return null;
+  if (text.includes("players from africa")) return "africa";
+  if (text.includes("players from europe")) return "europe";
+  if (text.includes("players from asia")) return "asia";
+  if (text.includes("players from south america")) return "south_america";
+  if (text.includes("players from north america")) return "north_america";
+  if (text.includes("players from oceania")) return "oceania";
+  return null;
+};
+
+const PLAYER_GEO_REGION_NATION_IDS = Object.freeze({
+  europe: Object.freeze([
+    1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+    23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
+    42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 205, 208, 219,
+  ]),
+  south_america: Object.freeze([52, 53, 54, 55, 56, 57, 58, 59, 60, 61]),
+  north_america: Object.freeze([
+    63, 64, 66, 67, 68, 70, 72, 73, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 87,
+    88, 89, 90, 91, 92, 93, 95, 207,
+  ]),
+  africa: Object.freeze([
+    97, 98, 99, 101, 103, 104, 105, 106, 107, 108, 110, 111, 112, 113, 114, 115,
+    116, 117, 118, 119, 120, 122, 123, 124, 126, 127, 128, 129, 130, 131, 132,
+    133, 135, 136, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148,
+  ]),
+  asia: Object.freeze([
+    149, 155, 157, 159, 161, 162, 163, 165, 166, 167, 168, 169, 171, 178, 180,
+    181, 182, 183, 186, 187, 191, 192, 213, 214,
+  ]),
+  oceania: Object.freeze([195, 197, 198, 199, 215]),
+});
 
 export const getRequirementFlags = (
   requirementsNormalized = [],
@@ -547,7 +588,12 @@ export const buildSolverContext = ({
       return lockedSlotPlayerIds.has(String(player.id));
     });
   }
-  if (prioritize?.duplicates) {
+  const normalizedPrioritize = {
+    ...(prioritize && typeof prioritize === "object" ? prioritize : {}),
+    storage: toBooleanSetting(prioritize?.storage, true),
+  };
+
+  if (normalizedPrioritize?.duplicates) {
     normalizedPlayers = normalizedPlayers
       .slice()
       .sort(
@@ -555,7 +601,7 @@ export const buildSolverContext = ({
           Number(Boolean(b.isDuplicate)) - Number(Boolean(a.isDuplicate)),
       );
   }
-  if (prioritize?.untradeables) {
+  if (normalizedPrioritize?.untradeables) {
     normalizedPlayers = normalizedPlayers
       .slice()
       .sort(
@@ -563,12 +609,10 @@ export const buildSolverContext = ({
           Number(Boolean(b.isUntradeable)) - Number(Boolean(a.isUntradeable)),
       );
   }
-  if (prioritize?.storage) {
+  if (normalizedPrioritize?.storage) {
     normalizedPlayers = normalizedPlayers
       .slice()
-      .sort(
-        (a, b) => Number(Boolean(b.isStorage)) - Number(Boolean(a.isStorage)),
-      );
+      .sort((a, b) => getStoragePreferenceScore(b) - getStoragePreferenceScore(a));
   }
   return {
     players: normalizedPlayers,
@@ -928,6 +972,20 @@ const buildPredicate = (rule) => {
     if (!ids.length) return null;
     return (player) => ids.includes(player.nationId);
   }
+  if (type === "player_geo_region") {
+    const normalizedValues = values.map(normalizeString).filter(Boolean);
+    const regionKey =
+      normalizedValues.find((value) => PLAYER_GEO_REGION_NATION_IDS[value]) ||
+      deriveGeoRegionKeyFromLabel(rule?.raw?.label) ||
+      deriveGeoRegionKeyFromLabel(rule?.label);
+    if (!regionKey) return null;
+    const ids = new Set(PLAYER_GEO_REGION_NATION_IDS[regionKey] || []);
+    if (!ids.size) return null;
+    return (player) => {
+      const nationId = toNumber(player?.nationId);
+      return nationId != null && ids.has(nationId);
+    };
+  }
   if (type === "league_id") {
     const ids = values.map(toNumber).filter((v) => v != null);
     if (!ids.length) return null;
@@ -1041,6 +1099,14 @@ const getSeedPoolBiasScore = (player, seed) => {
   if (!seed || typeof seed?.poolBias !== "function") return 0;
   const score = toNumber(seed.poolBias(player));
   return score == null ? 0 : score;
+};
+
+const getStoragePreferenceScore = (player) => {
+  if (!player) return 0;
+  if (player?.isStorage) return 3;
+  if (player?.hasStorageDuplicate) return 2;
+  if (player?.hasClubDuplicate) return 1;
+  return 0;
 };
 
 const getPrefillBiasBoost = (prefillBias, attr, group) => {
@@ -1355,6 +1421,7 @@ const PREFILL_PREFERENCE_TYPES = new Set([
   "nation_id",
   "league_id",
   "club_id",
+  "player_geo_region",
   "player_level",
   "player_quality",
   "player_rarity",
@@ -1529,6 +1596,7 @@ const prefillPlayers = (
       if (!check.ok) continue;
       const preferenceScore = getPreferenceScore(candidate);
       const seedBiasScore = getSeedPoolBiasScore(candidate, options?.seed);
+      const storagePreferenceScore = getStoragePreferenceScore(candidate);
       const distance = useRatingHint
         ? Math.abs((toNumber(candidate?.rating) ?? 0) - ratingHintPivot)
         : null;
@@ -1543,6 +1611,11 @@ const prefillPlayers = (
         (check.penalty === best.penalty &&
           preferenceScore === best.preferenceScore &&
           seedBiasScore === best.seedBiasScore &&
+          storagePreferenceScore > best.storagePreferenceScore) ||
+        (check.penalty === best.penalty &&
+          preferenceScore === best.preferenceScore &&
+          seedBiasScore === best.seedBiasScore &&
+          storagePreferenceScore === best.storagePreferenceScore &&
           (useRatingHint
             ? distance < best.distance ||
               (distance === best.distance &&
@@ -1554,6 +1627,7 @@ const prefillPlayers = (
           penalty: check.penalty,
           preferenceScore,
           seedBiasScore,
+          storagePreferenceScore,
           distance: distance ?? 0,
         };
       }
@@ -1590,6 +1664,9 @@ const prefillPlayers = (
           getSeedPoolBiasScore(a, options?.seed) -
           getSeedPoolBiasScore(b, options?.seed);
         if (seedBiasDiff !== 0) return seedBiasDiff;
+        const storagePreferenceDiff =
+          getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
+        if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
         if (useRatingHint) {
           const aDistance = Math.abs((toNumber(a?.rating) ?? 0) - ratingHintPivot);
           const bDistance = Math.abs((toNumber(b?.rating) ?? 0) - ratingHintPivot);
@@ -1872,6 +1949,7 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
       const check = canAddCandidate(candidate);
       if (!check.ok) continue;
       const preferenceScore = getPreferenceScore(candidate);
+      const storagePreferenceScore = getStoragePreferenceScore(candidate);
       const distance = useRatingHint
         ? Math.abs((toNumber(candidate?.rating) ?? 0) - ratingHintPivot)
         : null;
@@ -1882,6 +1960,10 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
           preferenceScore > best.preferenceScore) ||
         (check.penalty === best.penalty &&
           preferenceScore === best.preferenceScore &&
+          storagePreferenceScore > best.storagePreferenceScore) ||
+        (check.penalty === best.penalty &&
+          preferenceScore === best.preferenceScore &&
+          storagePreferenceScore === best.storagePreferenceScore &&
           (useRatingHint
             ? distance < best.distance ||
               (distance === best.distance &&
@@ -1892,6 +1974,7 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
           player: candidate,
           penalty: check.penalty,
           preferenceScore,
+          storagePreferenceScore,
           distance: distance ?? 0,
         };
       }
@@ -1923,6 +2006,9 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
       .sort((a, b) => {
         const preferenceDiff = getPreferenceScore(b) - getPreferenceScore(a);
         if (preferenceDiff !== 0) return preferenceDiff;
+        const storagePreferenceDiff =
+          getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
+        if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
         if (useRatingHint) {
           const aDistance = Math.abs((toNumber(a?.rating) ?? 0) - ratingHintPivot);
           const bDistance = Math.abs((toNumber(b?.rating) ?? 0) - ratingHintPivot);
@@ -1992,6 +2078,9 @@ const buildPureRatingOnlySquad = (squad, pool, squadSize, lockedIds) => {
       if (Boolean(a?.isSpecial) !== Boolean(b?.isSpecial)) {
         return Number(Boolean(a?.isSpecial)) - Number(Boolean(b?.isSpecial));
       }
+      const storagePreferenceDiff =
+        getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
+      if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
       return (toNumber(a?.id) ?? 0) - (toNumber(b?.id) ?? 0);
     });
 
@@ -2072,6 +2161,10 @@ const isRatingImproveMetricsBetter = (candidate, current, options = {}) => {
   if (c.highScore !== k.highScore) return c.highScore < k.highScore;
   if (c.highCount !== k.highCount) return c.highCount < k.highCount;
   if (c.maxRating !== k.maxRating) return c.maxRating < k.maxRating;
+  if (c.storageLinkedCount !== k.storageLinkedCount)
+    return c.storageLinkedCount > k.storageLinkedCount;
+  if (c.storageCount !== k.storageCount)
+    return c.storageCount > k.storageCount;
   if (c.sumRating !== k.sumRating) return c.sumRating < k.sumRating;
   return false;
 };
@@ -2483,6 +2576,7 @@ const getSquadPreservationMetrics = (
     (count, player) => (player?.isSpecial ? count + 1 : count),
     0,
   );
+  const storageUsage = getStorageUsageMetrics(squad || []);
   const excessInforms = Math.max(0, informCount - requiredInformsNumber);
   const excessSpecials = Math.max(0, specialCount - requiredSpecialsNumber);
   const highCount = ratings.reduce(
@@ -2507,6 +2601,10 @@ const getSquadPreservationMetrics = (
     requiredSpecials: requiredSpecialsNumber,
     informCount,
     specialCount,
+    storageCount: storageUsage.storageCount,
+    storageLinkedCount: storageUsage.storageLinkedCount,
+    storageDuplicateCount: storageUsage.storageDuplicateCount,
+    clubDuplicateCount: storageUsage.clubDuplicateCount,
     excessInforms,
     excessSpecials,
     highScore,
@@ -2535,6 +2633,12 @@ const isPreservationMetricsBetter = (candidate, current, options = {}) => {
   if (candidate.maxRating !== current.maxRating)
     return candidate.maxRating < current.maxRating;
   if (candidate.slack !== current.slack) return candidate.slack > current.slack;
+  if (candidate.storageLinkedCount !== current.storageLinkedCount) {
+    return candidate.storageLinkedCount > current.storageLinkedCount;
+  }
+  if (candidate.storageCount !== current.storageCount) {
+    return candidate.storageCount > current.storageCount;
+  }
   if (candidate.sumRating !== current.sumRating)
     return candidate.sumRating < current.sumRating;
   return false;
@@ -2579,6 +2683,7 @@ const getSolvedSquadValueMetrics = (
     (count, player) => (!player?.isUntradeable ? count + 1 : count),
     0,
   );
+  const storageUsage = getStorageUsageMetrics(list);
   const signature = options?.signature ?? null;
   const composition = buildCompositionSnapshot(list, list.length);
 
@@ -2686,6 +2791,10 @@ const getSolvedSquadValueMetrics = (
     highRatingCount: preservation.highCount,
     identityBalancePenalty,
     specialCount: preservation.specialCount,
+    storageCount: storageUsage.storageCount,
+    storageLinkedCount: storageUsage.storageLinkedCount,
+    storageDuplicateCount: storageUsage.storageDuplicateCount,
+    clubDuplicateCount: storageUsage.clubDuplicateCount,
     tradableCount,
     scarcityPenalty,
     sumRating: preservation.sumRating,
@@ -2710,6 +2819,10 @@ const isSolvedSquadValueBetter = (candidate, current) => {
     return candidate.sumRating < current.sumRating;
   if (candidate.specialCount !== current.specialCount)
     return candidate.specialCount < current.specialCount;
+  if (candidate.storageLinkedCount !== current.storageLinkedCount)
+    return candidate.storageLinkedCount > current.storageLinkedCount;
+  if (candidate.storageCount !== current.storageCount)
+    return candidate.storageCount > current.storageCount;
   if (candidate.tradableCount !== current.tradableCount)
     return candidate.tradableCount < current.tradableCount;
   if (candidate.scarcityPenalty !== current.scarcityPenalty)
@@ -2797,6 +2910,9 @@ const buildRefinementCandidatePool = (
     if (a.rating !== b.rating) return a.rating - b.rating;
     if (Boolean(a.player?.isSpecial) !== Boolean(b.player?.isSpecial))
       return Boolean(a.player?.isSpecial) ? 1 : -1;
+    const storagePreferenceDiff =
+      getStoragePreferenceScore(b.player) - getStoragePreferenceScore(a.player);
+    if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
     if (Boolean(a.player?.isUntradeable) !== Boolean(b.player?.isUntradeable))
       return Boolean(a.player?.isUntradeable) ? -1 : 1;
     if (a.scarcityPenalty !== b.scarcityPenalty)
@@ -2809,6 +2925,9 @@ const buildRefinementCandidatePool = (
     .slice()
     .sort((a, b) => {
       if (a.rating !== b.rating) return a.rating - b.rating;
+      const storagePreferenceDiff =
+        getStoragePreferenceScore(b.player) - getStoragePreferenceScore(a.player);
+      if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
       return desirabilitySort(a, b);
     })
     .slice(0, Math.min(40, maxCandidates));
@@ -2941,6 +3060,9 @@ const buildBalancedReplacementCandidates = (
       if (a.rating !== b.rating) return a.rating - b.rating;
       if (Boolean(a.player?.isSpecial) !== Boolean(b.player?.isSpecial))
         return Boolean(a.player?.isSpecial) ? 1 : -1;
+      const storagePreferenceDiff =
+        getStoragePreferenceScore(b.player) - getStoragePreferenceScore(a.player);
+      if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
       if (Boolean(a.player?.isUntradeable) !== Boolean(b.player?.isUntradeable))
         return Boolean(a.player?.isUntradeable) ? -1 : 1;
       return 0;
@@ -2953,6 +3075,9 @@ const buildBalancedReplacementCandidates = (
     .slice()
     .sort((a, b) => {
       if (a.rating !== b.rating) return a.rating - b.rating;
+      const storagePreferenceDiff =
+        getStoragePreferenceScore(b.player) - getStoragePreferenceScore(a.player);
+      if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
       return b.identityScore - a.identityScore;
     })
     .slice(0, Math.min(18, maxCandidates));
@@ -4365,6 +4490,9 @@ const reduceUniqueAttrCount = (
       const aSupply = supply.get(a?.[attr]) || 0;
       const bSupply = supply.get(b?.[attr]) || 0;
       if (bSupply !== aSupply) return bSupply - aSupply;
+      const storagePreferenceDiff =
+        getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
+      if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
       return a.rating - b.rating;
     });
 
@@ -4725,6 +4853,7 @@ const evaluateRule = (rule, squad, squadSize, evalCtx) => {
   }
   if (
     rule.type === "nation_id" ||
+    rule.type === "player_geo_region" ||
     rule.type === "league_id" ||
     rule.type === "club_id" ||
     rule.type === "player_level" ||
@@ -4957,6 +5086,9 @@ const improveChemistrySmart = (
     scored.sort((a, b) => {
       if (b.posMatches !== a.posMatches) return b.posMatches - a.posMatches;
       if (b.synergy !== a.synergy) return b.synergy - a.synergy;
+      const storagePreferenceDiff =
+        getStoragePreferenceScore(b.player) - getStoragePreferenceScore(a.player);
+      if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
       return a.player.rating - b.player.rating;
     });
 
@@ -5680,6 +5812,25 @@ const isRareNonSpecialPlayer = (player) => {
   return rarityId != null ? rarityId >= 1 : false;
 };
 
+const isStorageLinkedPlayer = (player) => getStoragePreferenceScore(player) > 0;
+
+const getStorageUsageMetrics = (players, squadSize = null) => {
+  const list = Array.isArray(players) ? players : [];
+  const n = Math.max(0, toNumber(squadSize) ?? list.length);
+  const squad = list.slice(0, n || list.length);
+  return {
+    storageCount: squad.filter((player) => Boolean(player?.isStorage)).length,
+    storageLinkedCount: squad.filter((player) => isStorageLinkedPlayer(player))
+      .length,
+    storageDuplicateCount: squad.filter((player) =>
+      Boolean(player?.hasStorageDuplicate),
+    ).length,
+    clubDuplicateCount: squad.filter((player) =>
+      Boolean(player?.hasClubDuplicate),
+    ).length,
+  };
+};
+
 const buildCompositionSnapshot = (players, squadSize = null) => {
   const list = Array.isArray(players) ? players : [];
   const n = Math.max(0, toNumber(squadSize) ?? list.length);
@@ -5687,6 +5838,7 @@ const buildCompositionSnapshot = (players, squadSize = null) => {
   const leagues = getDominantCountEntry(squad, "leagueId");
   const nations = getDominantCountEntry(squad, "nationId");
   const clubs = getDominantCountEntry(squad, "teamId");
+  const storageUsage = getStorageUsageMetrics(squad, squad.length);
   return {
     size: squad.length,
     uniqueLeagues: leagues.counts.size,
@@ -5700,6 +5852,7 @@ const buildCompositionSnapshot = (players, squadSize = null) => {
     dominantClubCount: clubs.count,
     specialCount: squad.filter((player) => Boolean(player?.isSpecial)).length,
     rareCount: squad.filter((player) => isRareNonSpecialPlayer(player)).length,
+    ...storageUsage,
   };
 };
 
@@ -7446,6 +7599,9 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
         getSeedPoolBiasScore(a, contextSeed) -
         getSeedPoolBiasScore(b, contextSeed);
       if (seedBiasDiff !== 0) return seedBiasDiff;
+      const storagePreferenceDiff =
+        getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
+      if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
       const ra = toNumber(a?.rating) ?? 0;
       const rb = toNumber(b?.rating) ?? 0;
       if (ra !== rb) return ra - rb;
@@ -8247,6 +8403,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       : null;
 
   timingsMs.total = Date.now() - startedAt;
+  const storageUsage = getStorageUsageMetrics(squad, squadSize);
   const solvedValue = solved
     ? getSolvedSquadValueMetrics(
         squad,
@@ -8282,6 +8439,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       adjustedAverage: roundTo(getSquadAdjustedAverage(squad), 2),
       squadRating: getSquadRating(squad),
       ratingTarget: ratingRequirement?.target ?? null,
+      storageUsage,
       timingsMs,
       chemistryTargets: chemistryRequired ? chemistryTargets : null,
       chemistry: chemistryRequired
@@ -8305,6 +8463,9 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
             leagueId: player?.leagueId ?? null,
             teamId: player?.teamId ?? null,
             rarityName: player?.rarityName ?? null,
+            isStorage: Boolean(player?.isStorage),
+            hasStorageDuplicate: Boolean(player?.hasStorageDuplicate),
+            hasClubDuplicate: Boolean(player?.hasClubDuplicate),
             alternativePositionNames: player?.alternativePositionNames ?? null,
           }))
         : null,
