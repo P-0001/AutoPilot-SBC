@@ -810,6 +810,37 @@ const getInformRequirementBounds = (rules, squadSize) => {
   return { min, max };
 };
 
+const getSpecialRequirementBounds = (rules, squadSize) => {
+  let min = 0;
+  let max = Infinity;
+  for (const rule of rules || []) {
+    if (
+      !rule ||
+      (rule.type !== "player_inform" &&
+        rule.type !== "player_tots" &&
+        rule.type !== "player_totw_or_tots")
+    ) {
+      continue;
+    }
+    const required = getRuleCount(rule, squadSize);
+    if (required == null) continue;
+    if (rule.op === "min") {
+      min = Math.max(min, required);
+      continue;
+    }
+    if (rule.op === "max") {
+      max = Math.min(max, required);
+      continue;
+    }
+    if (rule.op === "exact") {
+      min = Math.max(min, required);
+      max = Math.min(max, required);
+    }
+  }
+  if (!Number.isFinite(max)) max = Infinity;
+  return { min, max };
+};
+
 const getUniqueCountRequirementBounds = (rules, type, squadSize) => {
   let min = 0;
   let max = Infinity;
@@ -1107,6 +1138,142 @@ const getStoragePreferenceScore = (player) => {
   if (player?.hasStorageDuplicate) return 2;
   if (player?.hasClubDuplicate) return 1;
   return 0;
+};
+
+const compareBucketPlayers = (a, b, options = {}) => {
+  const avoidSpecials = options?.avoidSpecials !== false;
+  const avoidTotwOrTots = options?.avoidTotwOrTots !== false;
+  if (
+    avoidTotwOrTots &&
+    Boolean(a?.isTotwOrTots) !== Boolean(b?.isTotwOrTots)
+  ) {
+    return Boolean(a?.isTotwOrTots) ? 1 : -1;
+  }
+  if (avoidSpecials && Boolean(a?.isSpecial) !== Boolean(b?.isSpecial)) {
+    return Boolean(a?.isSpecial) ? 1 : -1;
+  }
+  if (Boolean(a?.isUntradeable) !== Boolean(b?.isUntradeable)) {
+    return Boolean(a?.isUntradeable) ? -1 : 1;
+  }
+  const storagePreferenceDiff =
+    getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
+  if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
+  return (toNumber(a?.id) ?? 0) - (toNumber(b?.id) ?? 0);
+};
+
+const buildRatingBucketCandidates = (players, options = {}) => {
+  const source = Array.isArray(players) ? players : [];
+  const pivot = Math.max(0, Math.round(toNumber(options?.pivot) ?? 84));
+  const maxRating =
+    toNumber(options?.maxRating) ??
+    source.reduce(
+      (max, player) => Math.max(max, toNumber(player?.rating) ?? 0),
+      0,
+    );
+  const maxCandidates = Math.max(1, toNumber(options?.maxCandidates) ?? 240);
+  const perRatingLimit = Math.max(1, toNumber(options?.perRatingLimit) ?? 32);
+  const specialPerRatingLimit = Math.max(
+    1,
+    toNumber(options?.specialPerRatingLimit) ?? 8,
+  );
+  const avoidSpecials = options?.avoidSpecials !== false;
+  const avoidTotwOrTots = options?.avoidTotwOrTots !== false;
+  const includeFallback = options?.includeFallback !== false;
+  const initialBelow = Math.max(0, toNumber(options?.initialBelow) ?? 2);
+  const initialAbove = Math.max(0, toNumber(options?.initialAbove) ?? 1);
+  const stageBelowStep = Math.max(1, toNumber(options?.stageBelowStep) ?? 1);
+  const stageAboveStep = Math.max(1, toNumber(options?.stageAboveStep) ?? 1);
+  const maxNormalAbove = Math.max(
+    initialAbove,
+    toNumber(options?.maxNormalAbove) ?? 5,
+  );
+  const maxNormalBelow = Math.max(
+    initialBelow,
+    toNumber(options?.maxNormalBelow) ?? 5,
+  );
+  const minAllowedRating =
+    toNumber(options?.minRating) ??
+    source.reduce(
+      (min, player) => Math.min(min, toNumber(player?.rating) ?? Infinity),
+      Infinity,
+    );
+  const byRating = new Map();
+  for (const player of source) {
+    if (!player || player.id == null) continue;
+    const rating = toNumber(player?.rating);
+    if (rating == null) continue;
+    if (rating > maxRating) continue;
+    if (rating < minAllowedRating) continue;
+    if (!byRating.has(rating)) byRating.set(rating, []);
+    byRating.get(rating).push(player);
+  }
+  for (const list of byRating.values()) {
+    list.sort((a, b) =>
+      compareBucketPlayers(a, b, { avoidSpecials, avoidTotwOrTots }),
+    );
+  }
+
+  const selected = [];
+  const seen = new Set();
+  const openedStages = [];
+  const pushRange = (minRating, maxStageRating, mode) => {
+    const minNum = Math.max(0, Math.floor(minRating));
+    const maxNum = Math.min(Math.floor(maxRating), Math.floor(maxStageRating));
+    if (maxNum < minNum || selected.length >= maxCandidates) return;
+    openedStages.push({ mode, minRating: minNum, maxRating: maxNum });
+    const ratings = [];
+    for (let rating = minNum; rating <= maxNum; rating += 1) {
+      ratings.push(rating);
+    }
+    ratings.sort((a, b) => {
+      const da = Math.abs(a - pivot);
+      const db = Math.abs(b - pivot);
+      if (da !== db) return da - db;
+      return a - b;
+    });
+    for (const rating of ratings) {
+      const list = byRating.get(rating) || [];
+      if (!list.length) continue;
+      let normalCount = 0;
+      let specialCount = 0;
+      for (const player of list) {
+        if (selected.length >= maxCandidates) break;
+        const id = player?.id;
+        if (id == null || seen.has(id)) continue;
+        const isSpecialCandidate =
+          Boolean(player?.isSpecial) || Boolean(player?.isTotwOrTots);
+        if (
+          mode !== "fallback" &&
+          ((avoidSpecials && player?.isSpecial) ||
+            (avoidTotwOrTots && player?.isTotwOrTots))
+        ) {
+          continue;
+        }
+        if (isSpecialCandidate) {
+          if (specialCount >= specialPerRatingLimit) continue;
+          specialCount += 1;
+        } else {
+          if (normalCount >= perRatingLimit) continue;
+          normalCount += 1;
+        }
+        seen.add(id);
+        selected.push(player);
+      }
+    }
+  };
+
+  for (
+    let below = initialBelow, above = initialAbove;
+    below <= maxNormalBelow || above <= maxNormalAbove;
+    below += stageBelowStep, above += stageAboveStep
+  ) {
+    pushRange(pivot - below, pivot + above, "efficient");
+    if (selected.length >= maxCandidates) break;
+  }
+  if (includeFallback && selected.length < maxCandidates) {
+    pushRange(minAllowedRating, maxRating, "fallback");
+  }
+  return { candidates: selected, openedStages };
 };
 
 const getPrefillBiasBoost = (prefillBias, attr, group) => {
@@ -1611,16 +1778,15 @@ const prefillPlayers = (
         (check.penalty === best.penalty &&
           preferenceScore === best.preferenceScore &&
           seedBiasScore === best.seedBiasScore &&
-          storagePreferenceScore > best.storagePreferenceScore) ||
-        (check.penalty === best.penalty &&
-          preferenceScore === best.preferenceScore &&
-          seedBiasScore === best.seedBiasScore &&
-          storagePreferenceScore === best.storagePreferenceScore &&
           (useRatingHint
             ? distance < best.distance ||
               (distance === best.distance &&
-                candidate.rating < best.player.rating)
-            : candidate.rating < best.player.rating))
+                (candidate.rating < best.player.rating ||
+                  (candidate.rating === best.player.rating &&
+                    storagePreferenceScore > best.storagePreferenceScore)))
+            : candidate.rating < best.player.rating ||
+              (candidate.rating === best.player.rating &&
+                storagePreferenceScore > best.storagePreferenceScore)))
       ) {
         best = {
           player: candidate,
@@ -1664,15 +1830,13 @@ const prefillPlayers = (
           getSeedPoolBiasScore(a, options?.seed) -
           getSeedPoolBiasScore(b, options?.seed);
         if (seedBiasDiff !== 0) return seedBiasDiff;
-        const storagePreferenceDiff =
-          getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
-        if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
         if (useRatingHint) {
           const aDistance = Math.abs((toNumber(a?.rating) ?? 0) - ratingHintPivot);
           const bDistance = Math.abs((toNumber(b?.rating) ?? 0) - ratingHintPivot);
           if (aDistance !== bDistance) return aDistance - bDistance;
         }
-        return a.rating - b.rating;
+        if (a.rating !== b.rating) return a.rating - b.rating;
+        return getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
       });
     for (const candidate of fallback) {
       if (remainingCapacity != null && squad.length >= squadSizeCap) break;
@@ -1960,15 +2124,15 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
           preferenceScore > best.preferenceScore) ||
         (check.penalty === best.penalty &&
           preferenceScore === best.preferenceScore &&
-          storagePreferenceScore > best.storagePreferenceScore) ||
-        (check.penalty === best.penalty &&
-          preferenceScore === best.preferenceScore &&
-          storagePreferenceScore === best.storagePreferenceScore &&
           (useRatingHint
             ? distance < best.distance ||
               (distance === best.distance &&
-                candidate.rating < best.player.rating)
-            : candidate.rating < best.player.rating))
+                (candidate.rating < best.player.rating ||
+                  (candidate.rating === best.player.rating &&
+                    storagePreferenceScore > best.storagePreferenceScore)))
+            : candidate.rating < best.player.rating ||
+              (candidate.rating === best.player.rating &&
+                storagePreferenceScore > best.storagePreferenceScore)))
       ) {
         best = {
           player: candidate,
@@ -2006,15 +2170,13 @@ const fillSquad = (squad, pool, squadSize, lockedIds, options = {}) => {
       .sort((a, b) => {
         const preferenceDiff = getPreferenceScore(b) - getPreferenceScore(a);
         if (preferenceDiff !== 0) return preferenceDiff;
-        const storagePreferenceDiff =
-          getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
-        if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
         if (useRatingHint) {
           const aDistance = Math.abs((toNumber(a?.rating) ?? 0) - ratingHintPivot);
           const bDistance = Math.abs((toNumber(b?.rating) ?? 0) - ratingHintPivot);
           if (aDistance !== bDistance) return aDistance - bDistance;
         }
-        return a.rating - b.rating;
+        if (a.rating !== b.rating) return a.rating - b.rating;
+        return getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
       });
     for (const player of remaining) {
       if (working.length >= target) break;
@@ -2050,10 +2212,20 @@ const isPureRatingOnlySbc = (rules = [], chemistryRequired = false) =>
     (rule) => rule && PURE_RATING_ONLY_RULE_TYPES.has(rule.type),
   );
 
-const buildPureRatingOnlySquad = (squad, pool, squadSize, lockedIds) => {
+const buildPureRatingOnlySquad = (
+  squad,
+  pool,
+  squadSize,
+  lockedIds,
+  options = {},
+) => {
   const working = Array.isArray(squad) ? squad.slice(0, squadSize) : [];
   const target = Math.max(0, toNumber(squadSize) ?? 0);
   if (working.length >= target) return working.slice(0, target);
+  const ratingTarget = toNumber(options?.ratingTarget);
+  const pivot =
+    toNumber(options?.pivot) ??
+    (ratingTarget != null ? Math.max(80, Math.floor(ratingTarget) - 1) : 84);
 
   const usedIds = new Set(
     working.map((player) => player?.id).filter((id) => id != null),
@@ -2064,25 +2236,25 @@ const buildPureRatingOnlySquad = (squad, pool, squadSize, lockedIds) => {
       .filter((value) => value != null)
       .map(String),
   );
-  const candidates = (pool || [])
+  const available = (pool || [])
     .filter((player) => player && player.id != null)
-    .filter((player) => !usedIds.has(player.id))
-    .slice()
-    .sort((a, b) => {
-      const ra = toNumber(a?.rating) ?? 0;
-      const rb = toNumber(b?.rating) ?? 0;
-      if (ra !== rb) return rb - ra;
-      if (Boolean(a?.isTotwOrTots) !== Boolean(b?.isTotwOrTots)) {
-        return Number(Boolean(a?.isTotwOrTots)) - Number(Boolean(b?.isTotwOrTots));
-      }
-      if (Boolean(a?.isSpecial) !== Boolean(b?.isSpecial)) {
-        return Number(Boolean(a?.isSpecial)) - Number(Boolean(b?.isSpecial));
-      }
-      const storagePreferenceDiff =
-        getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
-      if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
-      return (toNumber(a?.id) ?? 0) - (toNumber(b?.id) ?? 0);
-    });
+    .filter((player) => !usedIds.has(player.id));
+  const { candidates, openedStages } = buildRatingBucketCandidates(available, {
+    pivot,
+    maxCandidates: options?.maxCandidates ?? 260,
+    perRatingLimit: options?.perRatingLimit ?? 30,
+    specialPerRatingLimit: options?.specialPerRatingLimit ?? 8,
+    avoidSpecials: options?.avoidSpecials !== false,
+    avoidTotwOrTots: options?.avoidTotwOrTots !== false,
+    includeFallback: true,
+  });
+  options?.debugPush?.({
+    stage: "fill",
+    action: "pure_rating_buckets",
+    pivot,
+    candidateCount: candidates.length,
+    openedStages,
+  });
 
   for (const candidate of candidates) {
     if (working.length >= target) break;
@@ -2130,6 +2302,7 @@ const getRatingImproveMetrics = (
   targetRating,
   pivot,
   requiredInforms,
+  requiredSpecials = 0,
 ) => {
   const roundedAdjustedAverage = getSquadRoundedAdjustedAverage(squad);
   const threshold = getAdjustedAverageThresholdForRating(targetRating) ?? 0;
@@ -2143,6 +2316,7 @@ const getRatingImproveMetrics = (
       targetRating,
       pivot,
       requiredInforms,
+      requiredSpecials,
     ),
   };
 };
@@ -2195,8 +2369,11 @@ const improveRatingSmart = (
   if (!Array.isArray(pool) || pool.length < 1) return false;
 
   const requiredInforms = Math.max(0, toNumber(options?.requiredInforms) ?? 0);
+  const requiredSpecials = Math.max(0, toNumber(options?.requiredSpecials) ?? 0);
   const avoidInforms = options?.avoidInforms !== false;
+  const avoidTotwOrTots = options?.avoidTotwOrTots !== false;
   const preferLowerExcessInforms = options?.preferLowerExcessInforms !== false;
+  const seed = options?.seed ?? null;
 
   const pivot =
     toNumber(options?.pivot) ??
@@ -2223,17 +2400,30 @@ const improveRatingSmart = (
     ) || 0;
 
   let includeInformCandidates = true;
-  if (avoidInforms) {
+  if (avoidInforms || avoidTotwOrTots) {
     const currentInformCount = working.reduce(
       (count, player) => (isInformPlayer(player) ? count + 1 : count),
       0,
     );
-    if (currentInformCount >= requiredInforms) includeInformCandidates = false;
+    const currentSpecialCount = working.reduce(
+      (count, player) => (player?.isSpecial ? count + 1 : count),
+      0,
+    );
+    if (
+      (!avoidInforms || currentInformCount >= requiredInforms) &&
+      (!avoidTotwOrTots || currentSpecialCount >= requiredSpecials)
+    ) {
+      includeInformCandidates = false;
+    }
   }
 
   let available = includeInformCandidates
     ? availableAll
-    : availableAll.filter((player) => !isInformPlayer(player));
+    : availableAll.filter(
+        (player) =>
+          (!avoidInforms || !isInformPlayer(player)) &&
+          (!avoidTotwOrTots || !player?.isTotwOrTots),
+      );
   let maxPoolRating =
     available.reduce(
       (max, player) => Math.max(max, toNumber(player?.rating) ?? 0),
@@ -2246,44 +2436,28 @@ const improveRatingSmart = (
     target,
     pivot,
     requiredInforms,
+    requiredSpecials,
   );
 
   const buildCandidatesForCap = (capRating) => {
     const capNum = toNumber(capRating) ?? 0;
     const window = Math.max(2, toNumber(options?.window) ?? 8);
     const maxCandidates = Math.max(60, toNumber(options?.maxCandidates) ?? 240);
-
-    const capLimited = available
-      .filter((player) => (toNumber(player?.rating) ?? 0) <= capNum)
-      .slice()
-      .sort((a, b) => a.rating - b.rating);
-
-    const near = capLimited
-      .filter((player) => {
-        const rating = toNumber(player?.rating);
-        if (rating == null) return false;
-        return Math.abs(rating - pivot) <= window;
-      })
-      .sort((a, b) => a.rating - b.rating);
-
-    const high = capLimited
-      .slice()
-      .sort((a, b) => b.rating - a.rating)
-      .slice(0, 60);
-
-    const combined = [];
-    const seen = new Set();
-    for (const list of [high, near, capLimited]) {
-      for (const player of list) {
-        if (!player || player.id == null) continue;
-        if (seen.has(player.id)) continue;
-        seen.add(player.id);
-        combined.push(player);
-        if (combined.length >= maxCandidates) break;
-      }
-      if (combined.length >= maxCandidates) break;
-    }
-    return combined;
+    const { candidates } = buildRatingBucketCandidates(available, {
+      pivot,
+      maxRating: capNum,
+      maxCandidates,
+      perRatingLimit: options?.perRatingLimit ?? 24,
+      specialPerRatingLimit: options?.specialPerRatingLimit ?? 8,
+      initialBelow: Math.min(3, window),
+      initialAbove: Math.max(0, Math.min(capNum - pivot, capOffset)),
+      maxNormalBelow: window,
+      maxNormalAbove: Math.max(0, capNum - pivot),
+      avoidSpecials: !includeInformCandidates,
+      avoidTotwOrTots: !includeInformCandidates,
+      includeFallback: includeInformCandidates,
+    });
+    return candidates;
   };
 
   let iterations = 0;
@@ -2298,6 +2472,7 @@ const improveRatingSmart = (
       target,
       pivot,
       requiredInforms,
+      requiredSpecials,
     );
 
     let bestMove = null;
@@ -2342,6 +2517,7 @@ const improveRatingSmart = (
           target,
           pivot,
           requiredInforms,
+          requiredSpecials,
         );
         const improves = candidateMetrics.shortfall < currentMetrics.shortfall;
         if (
@@ -2443,6 +2619,7 @@ const improveRatingSmart = (
                 target,
                 pivot,
                 requiredInforms,
+                requiredSpecials,
               );
               const improves =
                 candidateMetrics.shortfall < currentMetrics.shortfall;
@@ -2473,10 +2650,15 @@ const improveRatingSmart = (
         cap = Math.min(maxPoolRating, Math.max(cap, pivot + capOffset));
         debugPush?.({
           stage: "rating",
-          action: "allow_informs",
+          action: "fallback_expand",
+          reason: "efficient_buckets_failed",
           cap,
           pivot,
+          maxRating: maxPoolRating,
+          allowSpecials: true,
+          allowTotwOrTots: true,
           requiredInforms,
+          requiredSpecials,
           currentRating: getSquadRating(working),
           metrics: currentMetrics,
         });
@@ -2545,6 +2727,7 @@ const improveRatingSmart = (
     cap,
     iterations,
     requiredInforms,
+    requiredSpecials,
     squadRating: getSquadRating(working),
     metrics: bestMetrics,
   });
@@ -3937,6 +4120,7 @@ const optimizeSquadForPreservation = (
   if (target == null) return { squad, changed: false };
 
   const requiredInforms = Math.max(0, toNumber(options?.requiredInforms) ?? 0);
+  const requiredSpecials = Math.max(0, toNumber(options?.requiredSpecials) ?? 0);
   const preferLowerExcessInforms = options?.preferLowerExcessInforms !== false;
   const pivot =
     toNumber(options?.pivot) ??
@@ -3961,6 +4145,7 @@ const optimizeSquadForPreservation = (
     target,
     pivot,
     requiredInforms,
+    requiredSpecials,
   );
 
   const buildOptimizationCandidates = () => {
@@ -4049,6 +4234,7 @@ const optimizeSquadForPreservation = (
           target,
           pivot,
           requiredInforms,
+          requiredSpecials,
         );
         if (
           isPreservationMetricsBetter(candidateMetrics, bestMetrics, {
@@ -4150,6 +4336,7 @@ const optimizeSquadForPreservation = (
                 target,
                 pivot,
                 requiredInforms,
+                requiredSpecials,
               );
               if (
                 isPreservationMetricsBetter(candidateMetrics, bestMetrics, {
@@ -4223,7 +4410,13 @@ const optimizeSquadForPreservation = (
   }
 
   const metricsAfter = changed
-    ? getSquadPreservationMetrics(working, target, pivot, requiredInforms)
+    ? getSquadPreservationMetrics(
+        working,
+        target,
+        pivot,
+        requiredInforms,
+        requiredSpecials,
+      )
     : metricsBefore;
 
   debugPush?.({
@@ -4490,10 +4683,11 @@ const reduceUniqueAttrCount = (
       const aSupply = supply.get(a?.[attr]) || 0;
       const bSupply = supply.get(b?.[attr]) || 0;
       if (bSupply !== aSupply) return bSupply - aSupply;
+      if (a.rating !== b.rating) return a.rating - b.rating;
       const storagePreferenceDiff =
         getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
       if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
-      return a.rating - b.rating;
+      return 0;
     });
 
     let bestMove = null;
@@ -4943,8 +5137,12 @@ const improveChemistrySmart = (
   const isExpired = () => deadlineAt != null && Date.now() >= deadlineAt;
 
   const requiredInforms = Math.max(0, toNumber(options?.requiredInforms) ?? 0);
+  const requiredSpecials = Math.max(0, toNumber(options?.requiredSpecials) ?? 0);
   const avoidInforms = options?.avoidInforms !== false && requiredInforms <= 0;
+  const avoidTotwOrTots =
+    options?.avoidTotwOrTots !== false && requiredSpecials <= 0;
   const preferLowerExcessInforms = options?.preferLowerExcessInforms !== false;
+  const seed = options?.seed ?? null;
   const ratingTarget = toNumber(options?.ratingTarget) ?? null;
   const pivot =
     toNumber(options?.pivot) ??
@@ -5057,7 +5255,8 @@ const improveChemistrySmart = (
     const available = (pool || [])
       .filter((player) => player && player.id != null)
       .filter((player) => !usedIds.has(player.id))
-      .filter((player) => (avoidInforms ? !isInformPlayer(player) : true));
+      .filter((player) => (avoidInforms ? !isInformPlayer(player) : true))
+      .filter((player) => (avoidTotwOrTots ? !player?.isTotwOrTots : true));
 
     const scoreCandidate = (player, posNames) => {
       const posMatches = posNames.reduce(
@@ -5086,10 +5285,16 @@ const improveChemistrySmart = (
     scored.sort((a, b) => {
       if (b.posMatches !== a.posMatches) return b.posMatches - a.posMatches;
       if (b.synergy !== a.synergy) return b.synergy - a.synergy;
+      const seedBiasDiff =
+        getSeedPoolBiasScore(a.player, seed) -
+        getSeedPoolBiasScore(b.player, seed);
+      if (seedBiasDiff !== 0) return seedBiasDiff;
+      if (a.player.rating !== b.player.rating)
+        return a.player.rating - b.player.rating;
       const storagePreferenceDiff =
         getStoragePreferenceScore(b.player) - getStoragePreferenceScore(a.player);
       if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
-      return a.player.rating - b.player.rating;
+      return 0;
     });
 
     const positionCoveragePerSlot = Math.max(
@@ -5212,6 +5417,7 @@ const improveChemistrySmart = (
       ratingTarget,
       pivot,
       requiredInforms,
+      requiredSpecials,
     );
     const currentKey = buildKey(bestChem, bestPenalty, currentPreserve);
 
@@ -5257,6 +5463,7 @@ const improveChemistrySmart = (
           ratingTarget,
           pivot,
           requiredInforms,
+          requiredSpecials,
         );
         const nextKey = buildKey(nextChem, nextPenalty, nextPreserve);
         if (!isKeyBetter(nextKey, currentKey)) continue;
@@ -5374,6 +5581,7 @@ const improveChemistrySmart = (
                   ratingTarget,
                   pivot,
                   requiredInforms,
+                  requiredSpecials,
                 );
                 const nextKey = buildKey(nextChem, nextPenalty, nextPreserve);
                 if (!isKeyBetter(nextKey, currentKey)) continue;
@@ -5434,6 +5642,7 @@ const improveChemistrySmart = (
             ratingTarget,
             pivot,
             requiredInforms,
+            requiredSpecials,
           );
           const key = buildKey(chem, penalty, preserve);
           return {
@@ -6131,7 +6340,9 @@ const getPhaseConfig = (signature, baseConfig = {}) => {
 };
 
 const buildSeedKey = (seed) =>
-  JSON.stringify({
+  seed?.key != null
+    ? String(seed.key)
+    : JSON.stringify({
     type: seed?.type ?? "baseline",
     axis: seed?.axis ?? null,
     groupId: seed?.groupId ?? null,
@@ -6146,17 +6357,24 @@ const createSeedDescriptor = ({
   label = "Baseline",
   strength = 3,
   poolFilter = null,
+  poolBias = null,
+  prefillBias = null,
+  key = null,
   tier = 0,
 }) => {
   const attr = axis ? AXIS_TO_ATTR[axis] ?? null : null;
   const biasMagnitude = Math.max(1, toNumber(strength) ?? 3) * 100;
   return {
+    key,
     type,
     axis,
     groupId,
     label,
     tier,
     poolBias:
+      typeof poolBias === "function"
+        ? poolBias
+        :
       attr && groupId != null
         ? (player) =>
             String(player?.[attr] ?? "") === String(groupId)
@@ -6164,6 +6382,9 @@ const createSeedDescriptor = ({
               : 0
         : null,
     prefillBias:
+      prefillBias && typeof prefillBias === "object"
+        ? prefillBias
+        :
       attr && groupId != null
         ? { axis, groupId, strength: Math.max(1, toNumber(strength) ?? 3) }
         : null,
@@ -6697,6 +6918,109 @@ const compareSolverResults = (a, b) => {
   );
 };
 
+const getTopClusterClubIds = (players, attr, value, limit = 2) => {
+  if (!attr || value == null) return [];
+  const byClub = new Map();
+  for (const player of players || []) {
+    if (!player || player.teamId == null) continue;
+    if (String(player?.[attr] ?? "") !== String(value)) continue;
+    if (!byClub.has(player.teamId)) {
+      byClub.set(player.teamId, {
+        clubId: player.teamId,
+        count: 0,
+        sumRating: 0,
+        positions: new Set(),
+      });
+    }
+    const entry = byClub.get(player.teamId);
+    entry.count += 1;
+    entry.sumRating += toNumber(player.rating) ?? 0;
+    const posNames = Array.isArray(player?.alternativePositionNames)
+      ? player.alternativePositionNames
+      : player?.preferredPositionName
+        ? [player.preferredPositionName]
+        : [];
+    for (const name of posNames) {
+      if (name != null) entry.positions.add(String(name));
+    }
+  }
+  return Array.from(byClub.values())
+    .filter((entry) => entry.count >= 2)
+    .sort((a, b) => {
+      if (b.positions.size !== a.positions.size)
+        return b.positions.size - a.positions.size;
+      if (b.count !== a.count) return b.count - a.count;
+      const avgA = a.count ? a.sumRating / a.count : 0;
+      const avgB = b.count ? b.sumRating / b.count : 0;
+      return avgB - avgA;
+    })
+    .slice(0, Math.max(1, toNumber(limit) ?? 2))
+    .map((entry) => entry.clubId);
+};
+
+const createHybridClusterSeed = ({
+  failures,
+  players,
+  index,
+  tier = 1,
+}) => {
+  const sourceFailures = (failures || []).filter(Boolean);
+  const leagueIds = new Set();
+  const nationIds = new Set();
+  const clubIds = new Set();
+
+  for (const failure of sourceFailures) {
+    const leagueId = toNumber(failure?.dominantLeague);
+    const nationId = toNumber(failure?.dominantNation);
+    const clubId = toNumber(failure?.dominantClub);
+    if (leagueId != null) leagueIds.add(leagueId);
+    if (nationId != null) nationIds.add(nationId);
+    if (clubId != null) clubIds.add(clubId);
+    for (const id of getTopClusterClubIds(players, "leagueId", leagueId, 2)) {
+      const numeric = toNumber(id);
+      if (numeric != null) clubIds.add(numeric);
+    }
+    for (const id of getTopClusterClubIds(players, "nationId", nationId, 2)) {
+      const numeric = toNumber(id);
+      if (numeric != null) clubIds.add(numeric);
+    }
+  }
+
+  if (leagueIds.size + nationIds.size + clubIds.size < 2) return null;
+  const leagueKey = Array.from(leagueIds).sort((a, b) => a - b);
+  const nationKey = Array.from(nationIds).sort((a, b) => a - b);
+  const clubKey = Array.from(clubIds).sort((a, b) => a - b);
+  const key = `hybrid:${tier}:${index}:l=${leagueKey.join(".")}:n=${nationKey.join(".")}:c=${clubKey.join(".")}`;
+
+  return createSeedDescriptor({
+    key,
+    type: "hybrid_cluster",
+    label: `Hybrid cluster ${index}`,
+    tier,
+    poolFilter: (player) => {
+      if (!player) return false;
+      return (
+        clubIds.has(toNumber(player.teamId)) ||
+        leagueIds.has(toNumber(player.leagueId)) ||
+        nationIds.has(toNumber(player.nationId))
+      );
+    },
+    poolBias: (player) => {
+      if (!player) return 0;
+      let score = 0;
+      const inClub = clubIds.has(toNumber(player.teamId));
+      const inLeague = leagueIds.has(toNumber(player.leagueId));
+      const inNation = nationIds.has(toNumber(player.nationId));
+      if (inClub) score -= 900;
+      if (inLeague) score -= 260;
+      if (inNation) score -= 260;
+      if (inClub && (inLeague || inNation)) score -= 180;
+      if (inLeague && inNation) score -= 120;
+      return score;
+    },
+  });
+};
+
 const generateRescueSeeds = (
   signature,
   failureMemory,
@@ -6710,59 +7034,100 @@ const generateRescueSeeds = (
   if (!bestFailure) return { tier1: [], tier3: [] };
   const tier1 = [];
   const tier3 = [];
+  const queuedSeedKeys = new Set();
   const pushSeed = (list, seed) => {
     if (!seed) return;
     const key = buildSeedKey(seed);
     if (triedSeedKeys.has(key)) return;
-    triedSeedKeys.add(key);
+    if (queuedSeedKeys.has(key)) return;
+    queuedSeedKeys.add(key);
     list.push(seed);
   };
-  if (
-    bestFailure.dominantLeague != null &&
-    toNumber(bestFailure.dominantLeagueCount) >=
-      Math.max(3, Math.floor((squadSize || 11) / 3))
-  ) {
-    pushSeed(
-      tier1,
-      createSeedDescriptor({
-        type: "rescue_full_dominant_league",
-        axis: "league",
-        groupId: bestFailure.dominantLeague,
-        label: `Rescue league ${bestFailure.dominantLeague}`,
-        strength: 6,
-        tier: 1,
-      }),
-    );
-    pushSeed(
-      tier3,
-      createSeedDescriptor({
-        type: "rescue_full_dominant_league",
-        axis: "league",
-        groupId: bestFailure.dominantLeague,
-        label: `Rescue hard league ${bestFailure.dominantLeague}`,
-        strength: 7,
-        tier: 3,
-        poolFilter: (player) =>
-          String(player?.leagueId ?? "") === String(bestFailure.dominantLeague),
-      }),
-    );
+  const usefulFailures = sortedFailures.slice(0, 4);
+  for (const failure of usefulFailures) {
+    if (
+      failure.dominantLeague != null &&
+      toNumber(failure.dominantLeagueCount) >=
+        Math.max(3, Math.floor((squadSize || 11) / 3))
+    ) {
+      pushSeed(
+        tier1,
+        createSeedDescriptor({
+          type: "rescue_full_dominant_league",
+          axis: "league",
+          groupId: failure.dominantLeague,
+          label: `Rescue league ${failure.dominantLeague}`,
+          strength: 6,
+          tier: 1,
+        }),
+      );
+      pushSeed(
+        tier3,
+        createSeedDescriptor({
+          type: "rescue_full_dominant_league",
+          axis: "league",
+          groupId: failure.dominantLeague,
+          label: `Rescue hard league ${failure.dominantLeague}`,
+          strength: 7,
+          tier: 3,
+          poolFilter: (player) =>
+            String(player?.leagueId ?? "") === String(failure.dominantLeague),
+        }),
+      );
+    }
+    if (
+      failure.dominantNation != null &&
+      toNumber(failure.dominantNationCount) >=
+        Math.max(3, Math.floor((squadSize || 11) / 3))
+    ) {
+      pushSeed(
+        tier1,
+        createSeedDescriptor({
+          type: "rescue_full_dominant_nation",
+          axis: "nation",
+          groupId: failure.dominantNation,
+          label: `Rescue nation ${failure.dominantNation}`,
+          strength: 6,
+          tier: 1,
+        }),
+      );
+    }
   }
-  if (
-    bestFailure.dominantNation != null &&
-    toNumber(bestFailure.dominantNationCount) >=
-      Math.max(3, Math.floor((squadSize || 11) / 3))
-  ) {
-    pushSeed(
-      tier1,
-      createSeedDescriptor({
-        type: "rescue_full_dominant_nation",
-        axis: "nation",
-        groupId: bestFailure.dominantNation,
-        label: `Rescue nation ${bestFailure.dominantNation}`,
-        strength: 6,
-        tier: 1,
-      }),
+  const nearChemistryFailures = sortedFailures.filter((failure) => {
+    const shortfall = toNumber(failure?.chemShortfall);
+    if (shortfall == null || shortfall <= 0 || shortfall > 4) return false;
+    const failingTypes = Array.isArray(failure?.failingTypes)
+      ? failure.failingTypes
+      : [];
+    return (
+      failingTypes.length > 0 &&
+      failingTypes.every(
+        (type) =>
+          type === "chemistry_points" ||
+          type === "all_players_chemistry_points",
+      )
     );
+  });
+  if (signature?.isCompositionPuzzle && nearChemistryFailures.length >= 2) {
+    let hybridIndex = 0;
+    for (let i = 0; i < Math.min(nearChemistryFailures.length, 4); i += 1) {
+      for (
+        let j = i + 1;
+        j < Math.min(nearChemistryFailures.length, 4);
+        j += 1
+      ) {
+        const seed = createHybridClusterSeed({
+          failures: [nearChemistryFailures[i], nearChemistryFailures[j]],
+          players,
+          index: hybridIndex,
+          tier: 2,
+        });
+        hybridIndex += 1;
+        pushSeed(tier1, seed);
+        if (hybridIndex >= 4) break;
+      }
+      if (hybridIndex >= 4) break;
+    }
   }
   for (const groupId of signature?.requiredLeagueIds || []) {
     pushSeed(
@@ -7016,6 +7381,9 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
         });
       }
     : null;
+  const solverDeadlineAt = toNumber(context?.optimize?.solverDeadlineAt) ?? null;
+  const isSolverDeadlineExpired = () =>
+    solverDeadlineAt != null && Date.now() >= solverDeadlineAt;
   const normalizePlayersStart = Date.now();
   const normalizedPool = normalizePlayers(players);
   const normalizedPlayers =
@@ -7050,6 +7418,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
   const chemistryRequired =
     chemistryTargets?.total != null || chemistryTargets?.minEach != null;
   const informBounds = getInformRequirementBounds(rules, squadSize);
+  const specialBounds = getSpecialRequirementBounds(rules, squadSize);
   const appliedFilters = [];
   const ignoredRequirements = [];
 
@@ -7583,7 +7952,13 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
   }
 
   if (isPureRatingOnlySbc(rules, chemistryRequired)) {
-    squad = buildPureRatingOnlySquad(squad, pool, squadSize, lockedIds);
+    squad = buildPureRatingOnlySquad(squad, pool, squadSize, lockedIds, {
+      ratingTarget: ratingRequirement?.target ?? null,
+      pivot: ratingFillHint?.pivot ?? null,
+      avoidSpecials: true,
+      avoidTotwOrTots: !explicitTotwOrTotsRequirement,
+      debugPush,
+    });
     rebuildLockedIdsFromSquad(squad, lockedIds);
     debugPush?.({
       stage: "fill",
@@ -7599,13 +7974,12 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
         getSeedPoolBiasScore(a, contextSeed) -
         getSeedPoolBiasScore(b, contextSeed);
       if (seedBiasDiff !== 0) return seedBiasDiff;
-      const storagePreferenceDiff =
-        getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
-      if (storagePreferenceDiff !== 0) return storagePreferenceDiff;
       const ra = toNumber(a?.rating) ?? 0;
       const rb = toNumber(b?.rating) ?? 0;
       if (ra !== rb) return ra - rb;
-      return (a?.isSpecial ? 1 : 0) - (b?.isSpecial ? 1 : 0);
+      const specialDiff = (a?.isSpecial ? 1 : 0) - (b?.isSpecial ? 1 : 0);
+      if (specialDiff !== 0) return specialDiff;
+      return getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
     });
 
     const fillPreferencePredicates = buildPrefillPreferencePredicates(
@@ -7759,9 +8133,12 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
           maxIterations: context?.optimize?.ratingMaxIterations ?? 80,
           capOffset: context?.optimize?.ratingCapOffset ?? 2,
           requiredInforms: informBounds?.min ?? 0,
-          avoidInforms: !useTotwPlayers
-            ? context?.optimize?.avoidInforms !== false
-            : false,
+          requiredSpecials: specialBounds?.min ?? 0,
+          avoidInforms: context?.optimize?.avoidInforms !== false,
+          avoidTotwOrTots:
+            useTotwPlayers && !explicitTotwOrTotsRequirement
+              ? context?.optimize?.avoidTotwOrTots !== false
+              : false,
           preferLowerExcessInforms: preferLowerExcessInformsDuringSolve,
           // For simple "upgrade" SBCs (rating + inform), keep the candidate windows tight to avoid
           // burning time scanning thousands of unnecessary swaps.
@@ -7797,12 +8174,13 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
         {
           pivot: context?.optimize?.preservePivot ?? null,
           maxIterations: isSimpleRatingSbc
-            ? Math.min(toNumber(preserveMaxIterations) ?? 30, 12)
+            ? Math.max(toNumber(preserveMaxIterations) ?? 30, 30)
             : preserveMaxIterations,
           requiredInforms: informBounds?.min ?? 0,
+          requiredSpecials: specialBounds?.min ?? 0,
           preferLowerExcessInforms: true,
-          window: isSimpleRatingSbc ? 4 : undefined,
-          maxCandidates: isSimpleRatingSbc ? 120 : undefined,
+          window: isSimpleRatingSbc ? 8 : undefined,
+          maxCandidates: isSimpleRatingSbc ? 220 : undefined,
           pairCandidates: isSimpleRatingSbc ? 70 : undefined,
           pairOutlierThreshold: isSimpleRatingSbc ? 4 : undefined,
         },
@@ -7870,10 +8248,14 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
           chemistryEscapePenaltySlack: baseChemEscapePenaltySlack,
           ratingTarget: ratingRequirement?.target ?? null,
           pivot: context?.optimize?.preservePivot ?? null,
+          seed: contextSeed,
           requiredInforms: informBounds?.min ?? 0,
-          avoidInforms: !useTotwPlayers
-            ? context?.optimize?.avoidInforms !== false
-            : false,
+          requiredSpecials: specialBounds?.min ?? 0,
+          avoidInforms: context?.optimize?.avoidInforms !== false,
+          avoidTotwOrTots:
+            useTotwPlayers && !explicitTotwOrTotsRequirement
+              ? context?.optimize?.avoidTotwOrTots !== false
+              : false,
           preferLowerExcessInforms: preferLowerExcessInformsDuringSolve,
           timeBudgetMs: context?.optimize?.chemTimeBudgetMs ?? null,
         };
@@ -8088,8 +8470,9 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       {
         ratingTarget: ratingRequirement?.target ?? null,
         pivot: context?.optimize?.preservePivot ?? null,
+        seed: contextSeed,
         requiredInforms: informBounds?.min ?? 0,
-        requiredSpecials: 0,
+        requiredSpecials: specialBounds?.min ?? 0,
         chemistryRequired,
         slotsForChemistry,
         chemistryTargets,
@@ -8147,7 +8530,8 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
     chemistryRequired &&
     chemistryTargets?.total != null &&
     isOnlyChemistryFailing(failingRequirements) &&
-    context?.optimize?.chemClubSearch !== false
+    context?.optimize?.chemClubSearch !== false &&
+    !isSolverDeadlineExpired()
   ) {
     const clubBounds = getUniqueCountRequirementBounds(
       rules,
@@ -8237,6 +8621,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
         let bestFound = null;
 
         const runRestrictedSolve = (clubSet, debug) => {
+          if (isSolverDeadlineExpired()) return null;
           const allowed = clubSet instanceof Set ? clubSet : new Set();
           const restrictedPlayers = (normalizedPlayers || []).filter(
             (player) => {
@@ -8255,6 +8640,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
               optimize: {
                 ...(context?.optimize || {}),
                 chemClubSearch: false,
+                solverDeadlineAt,
               },
             },
             contextSeed,
@@ -8265,6 +8651,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
         const debugWanted = Boolean(context?.debug);
 
         for (let step = 0; step < maxSteps; step += 1) {
+          if (isSolverDeadlineExpired()) break;
           if (currentShortfall <= 0) break;
 
           let bestNeighbor = null;
@@ -8307,6 +8694,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
 
           // Evaluate neighbors. Keep only those that fail chemistry only.
           for (const nextClubs of nextClubSets) {
+            if (isSolverDeadlineExpired()) break;
             const res = runRestrictedSolve(nextClubs, false);
             if (!res) continue;
             const failing = Array.isArray(res.failingRequirements)
@@ -8412,7 +8800,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
         {
           pivot: context?.optimize?.preservePivot ?? null,
           requiredInforms: informBounds?.min ?? 0,
-          requiredSpecials: 0,
+          requiredSpecials: specialBounds?.min ?? 0,
           signature,
         },
       )
@@ -8518,6 +8906,13 @@ export const solveSquad = (context) => {
     signature,
     baseContext?.optimize || {},
   );
+  if (
+    signature?.isCompositionPuzzle &&
+    baseContext?.optimize?.chemClubSearch == null
+  ) {
+    baselinePhaseConfig.optimize.chemClubSearch = false;
+    fallbackPhaseConfig.optimize.chemClubSearch = false;
+  }
   const restartTimeBudgetMs = Math.max(
     1000,
     toNumber(baseContext?.optimize?.restartTimeBudgetMs) ??
@@ -8552,6 +8947,13 @@ export const solveSquad = (context) => {
     const key = buildSeedKey(seed);
     if (triedSeedKeys.has(key)) return null;
     triedSeedKeys.add(key);
+    const phaseConfigWithDeadline = {
+      ...(activePhaseConfig || {}),
+      optimize: {
+        ...((activePhaseConfig && activePhaseConfig.optimize) || {}),
+        solverDeadlineAt: activeDeadlineAt,
+      },
+    };
     const result = runPipeline(
       {
         ...baseContext,
@@ -8559,7 +8961,7 @@ export const solveSquad = (context) => {
         signature,
       },
       seed,
-      activePhaseConfig,
+      phaseConfigWithDeadline,
     );
     const failureSummary = summarizeFailure(
       result,
