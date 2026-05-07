@@ -3715,6 +3715,7 @@
     } catch {}
     const appliedCount = loadedItems.length;
     const isPartialApply = appliedCount < ids.length;
+    const saveSucceeded = saveResult?.success === true;
     try {
       onApplied?.({
         challengeId: challenge?.id ?? null,
@@ -3724,13 +3725,17 @@
         missing: missingIds.length,
         partial: isPartialApply,
         movedToClub: movedCount,
-        saveSuccess: saveResult?.success === true,
+        saveSuccess: saveSucceeded,
       });
     } catch {}
 
     return {
-      ok: !isPartialApply,
-      reason: isPartialApply ? "PARTIAL_APPLY" : null,
+      ok: saveSucceeded && !isPartialApply,
+      reason: !saveSucceeded
+        ? "SAVE_FAILED"
+        : isPartialApply
+          ? "PARTIAL_APPLY"
+          : null,
       saveResult,
       requested: ids.length,
       appliedCount,
@@ -4147,20 +4152,31 @@
       );
     }
     const challenges = sets.flatMap((s) => s.getChallenges?.() ?? []);
-    // Prefer exact ID match.
-    const byId =
-      challenges.find((c) => String(c?.id) === String(challengeId)) ?? null;
-    if (byId) return byId;
+    const isOpenChallenge = (challenge) => {
+      try {
+        return !challenge?.isCompleted?.();
+      } catch {
+        return true;
+      }
+    };
+    // Prefer an open exact ID match. Repeatable sets can keep the same
+    // challenge ID around briefly after submit, so a completed ID match is
+    // only useful as a last fallback.
+    const idMatches = challenges.filter(
+      (c) => String(c?.id) === String(challengeId),
+    );
+    const openById = idMatches.find(isOpenChallenge) ?? null;
+    if (openById) return openById;
     // Fallback: match by name (EA may re-instantiate repeatable challenges
     // with fresh IDs between cycles).
     if (challengeName) {
       const byName =
         challenges.find(
-          (c) => (c?.name ?? c?.title) === challengeName && !c.isCompleted?.(),
+          (c) => (c?.name ?? c?.title) === challengeName && isOpenChallenge(c),
         ) ?? null;
       if (byName) return byName;
     }
-    return null;
+    return idMatches[0] ?? null;
   };
 
   const toChallengePayload = (challenge) => {
@@ -15003,9 +15019,9 @@
           </aside>
           <div class="ea-data-sequence-main">
             <div class="ea-data-sequence-tabs">
-              <button type="button" class="ea-data-sequence-tab is-active" data-tab="steps">Steps<span class="ea-data-sequence-tab-indicator" id="ea-data-sequence-toolbar-count">0</span></button>
-              <button type="button" class="ea-data-sequence-tab" data-tab="settings">Settings</button>
-              <button type="button" class="ea-data-sequence-tab" data-tab="execution">Execution</button>
+              <button type="button" class="ea-data-sequence-tab is-active" data-tab="steps"><span class="ea-data-sequence-tab-label">Steps<span class="ea-data-sequence-tab-indicator" id="ea-data-sequence-toolbar-count">0</span></span></button>
+              <button type="button" class="ea-data-sequence-tab" data-tab="settings"><span class="ea-data-sequence-tab-label">Settings</span></button>
+              <button type="button" class="ea-data-sequence-tab" data-tab="execution"><span class="ea-data-sequence-tab-label">Execution</span></button>
             </div>
             <div class="ea-data-sequence-status-bar">
               <div class="ea-data-sequence-status-text" id="ea-data-sequence-toolbar-status">Preparing planner...</div>
@@ -15096,12 +15112,41 @@
       return `${count}x loop${count === 1 ? "" : "s"}`;
     };
 
+    const getSequenceSubmitModeMeta = (mode) => {
+      const normalized = normalizeSequenceSubmitMode(mode);
+      if (normalized === SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL) {
+        return {
+          mode: normalized,
+          label: "Submit as it solves",
+          shortLabel: "Live Submit",
+          actionLabel: "\u25B6 Run & Submit",
+          summaryLabel: "Submitted Players",
+          ratingsLabel: "Submitted Ratings",
+          emptyPlayersLabel: "No submitted players yet",
+          copy: "Solve each challenge, submit it immediately, then continue.",
+        };
+      }
+      return {
+        mode: SEQUENCE_SUBMIT_MODE_REVIEW_FIRST,
+        label: "Review then submit",
+        shortLabel: "Review First",
+        actionLabel: "\u25B6 Solve Plan",
+        summaryLabel: "Planned Players",
+        ratingsLabel: "Planned Ratings",
+        emptyPlayersLabel: "No planned players yet",
+        copy: "Solve the full plan first, show the player list, then submit after confirmation.",
+      };
+    };
+
     const normalizeRunStatusKey = (value) => {
       const text = String(value ?? "")
         .trim()
         .toLowerCase();
       if (!text) return "idle";
       if (text === "completed") return "completed";
+      if (text === "ready_to_submit" || text === "review_ready") {
+        return "ready_to_submit";
+      }
       if (text === "partial") return "partial";
       if (text === "failed") return "failed";
       if (text === "stopped") return "stopped";
@@ -15151,6 +15196,10 @@
       const normalizedPartialFailureSummary = normalizeSequenceRuntimeCopy(
         buildSequenceFailureSummary(latestFailureContext, { mode: "partial" }),
       );
+
+      if (normalizedStatus === "ready_to_submit") {
+        return runtimeCopy || "Solved squads are ready to review and submit.";
+      }
 
       if (normalizedStatus === "completed") {
         return "Sequence completed.";
@@ -15376,7 +15425,9 @@
     }
 
     function getSequenceProgressFillState({ statusKey, progressPct }) {
-      return normalizeRunStatusKey(statusKey) === "completed" &&
+      const normalizedStatus = normalizeRunStatusKey(statusKey);
+      return (normalizedStatus === "completed" ||
+        normalizedStatus === "ready_to_submit") &&
         Number(progressPct) >= 100
         ? "completed"
         : "active";
@@ -16091,6 +16142,18 @@
     const renderRuntimeSurface = () => {
       const state = sequenceSolveOverlayState;
       const runState = state?.runState ?? null;
+      const activePlan = getActivePlan();
+      const runSubmitModeMeta = getSequenceSubmitModeMeta(
+        runState?.submitMode ?? activePlan?.policy?.submitMode,
+      );
+      const planSubmitModeMeta = getSequenceSubmitModeMeta(
+        activePlan?.policy?.submitMode ?? runSubmitModeMeta.mode,
+      );
+      const pendingSequenceSubmissions = Array.isArray(
+        state?.pendingSequenceSubmissions,
+      )
+        ? state.pendingSequenceSubmissions
+        : [];
       const counters = runState?.counters ?? {
         solved: 0,
         skipped: 0,
@@ -16098,6 +16161,58 @@
       };
       const statusText = sanitizeDisplayText(runState?.status) ?? "idle";
       const runBadgeStatus = normalizeRunStatusKey(statusText);
+      const runBadgeLabel =
+        runBadgeStatus === "ready_to_submit" ? "Ready To Submit" : statusText;
+      const isReviewReady = runBadgeStatus === "ready_to_submit";
+      const isCompletedRun = runBadgeStatus === "completed";
+      const executionPhase = String(runState?.executionPhase ?? "")
+        .trim()
+        .toLowerCase();
+      const isReviewSubmitting =
+        runSubmitModeMeta.mode === SEQUENCE_SUBMIT_MODE_REVIEW_FIRST &&
+        executionPhase === "submitting";
+      const isReviewSubmitted =
+        runSubmitModeMeta.mode === SEQUENCE_SUBMIT_MODE_REVIEW_FIRST &&
+        (executionPhase === "submitted" || isCompletedRun);
+      const isReviewSubmitDashboard =
+        isReviewReady || isReviewSubmitting || isReviewSubmitted;
+      const submissionTotal =
+        readNumeric(runState?.submissionTotal) ??
+        readNumeric(runState?.plannedChallenges) ??
+        pendingSequenceSubmissions.length;
+      const pendingSubmitCount = isReviewSubmitDashboard
+        ? pendingSequenceSubmissions.length
+        : 0;
+      const queuedSubmissionsByStepId = new Map();
+      if (isReviewSubmitDashboard) {
+        for (const entry of pendingSequenceSubmissions) {
+          const stepId = entry?.step?.id ?? null;
+          if (stepId == null) continue;
+          const key = String(stepId);
+          queuedSubmissionsByStepId.set(
+            key,
+            (queuedSubmissionsByStepId.get(key) ?? 0) + 1,
+          );
+        }
+      }
+      const displayCounterLabels = isReviewSubmitDashboard
+        ? {
+            solved: "Submitted",
+            skipped: "Queued",
+            failed: "Failed",
+          }
+        : {
+            solved: "Solved",
+            skipped: "Skipped",
+            failed: "Failed",
+          };
+      const displayCounters = isReviewSubmitDashboard
+        ? {
+            solved: counters?.solved ?? 0,
+            skipped: pendingSubmitCount,
+            failed: counters?.failed ?? 0,
+          }
+        : counters;
       const primaryMessage = buildSequenceRuntimePrimaryMessage({
         statusKey: runBadgeStatus,
         runtimeStatusText: state?.runtimeStatusText,
@@ -16128,15 +16243,28 @@
         `Step loop ${Math.max(0, stepLoopPass)}/${stepLoopCount}`,
         `Current step: ${currentStepLabel}`,
       ].join(" • ");
-      const processedChallenges = getRunProcessedChallengeCount(runState);
-      const plannedChallenges = Math.max(
-        processedChallenges,
-        Math.max(0, Math.floor(readNumeric(runState?.plannedChallenges) ?? 0)),
-      );
-      const completedProgressUnits = Math.max(
-        processedChallenges * SEQUENCE_PROGRESS_PHASE_UNIT_COUNT,
-        Math.max(0, Math.floor(readNumeric(runState?.completedProgressUnits) ?? 0)),
-      );
+      const solvedProcessedChallenges = getRunProcessedChallengeCount(runState);
+      const processedChallenges = isReviewSubmitDashboard
+        ? (counters?.solved ?? 0) + (counters?.failed ?? 0)
+        : solvedProcessedChallenges;
+      const plannedChallenges = isReviewSubmitDashboard
+        ? Math.max(processedChallenges, submissionTotal)
+        : Math.max(
+            solvedProcessedChallenges,
+            Math.max(
+              0,
+              Math.floor(readNumeric(runState?.plannedChallenges) ?? 0),
+            ),
+          );
+      const completedProgressUnits = isReviewReady
+        ? 0
+        : Math.max(
+            processedChallenges * SEQUENCE_PROGRESS_PHASE_UNIT_COUNT,
+            Math.max(
+              0,
+              Math.floor(readNumeric(runState?.completedProgressUnits) ?? 0),
+            ),
+          );
       const plannedProgressUnits = Math.max(
         completedProgressUnits,
         plannedChallenges * SEQUENCE_PROGRESS_PHASE_UNIT_COUNT,
@@ -16164,7 +16292,14 @@
       const usedSummary =
         runState?.usedSummary && typeof runState.usedSummary === "object"
           ? runState.usedSummary
-          : createEmptyRunUsedSummary();
+          : createEmptyRunUsedSummary(getSequenceSubmitModeMeta(runState?.submitMode));
+      const usedSummaryTitle =
+        sanitizeDisplayText(usedSummary?.summaryLabel) ?? "Submitted Players";
+      const usedRatingsTitle =
+        sanitizeDisplayText(usedSummary?.ratingsLabel) ?? "Submitted Ratings";
+      const usedEmptyText =
+        sanitizeDisplayText(usedSummary?.emptyPlayersLabel) ??
+        "No submitted players yet";
       const usedEntries = Array.isArray(usedSummary?.entries)
         ? usedSummary.entries
         : [];
@@ -16192,7 +16327,9 @@
               <div class="ea-data-sequence-used-entry">
                 <div class="ea-data-sequence-used-header">
                   <div class="ea-data-sequence-used-header-left">
-                    <div class="ea-data-used-summary-title">Submitted Players</div>
+                    <div class="ea-data-used-summary-title">${escapeHtml(
+                      usedSummaryTitle,
+                    )}</div>
                     <div class="ea-data-sequence-used-entry-title">${escapeHtml(
                       challengeLabel,
                     )}</div>
@@ -16229,7 +16366,11 @@
               </div>
             `;
           })()
-        : '<div class="ea-data-used-summary"><div class="ea-data-used-summary-top"><div class="ea-data-used-summary-title">Submitted Players</div></div><div class="ea-data-sequence-empty">No submitted players yet</div></div>';
+        : `<div class="ea-data-used-summary"><div class="ea-data-used-summary-top"><div class="ea-data-used-summary-title">${escapeHtml(
+            usedSummaryTitle,
+          )}</div></div><div class="ea-data-sequence-empty">${escapeHtml(
+            usedEmptyText,
+          )}</div></div>`;
       const usedRatingEntries = Object.entries(
         usedSummary?.ratings && typeof usedSummary.ratings === "object"
           ? usedSummary.ratings
@@ -16250,7 +16391,7 @@
                 )}</span>`,
             )
             .join("")
-        : '<span class="ea-data-pill">No submitted players yet</span>';
+        : `<span class="ea-data-pill">${escapeHtml(usedEmptyText)}</span>`;
       const runtimeSteps = Array.isArray(runState?.steps) ? runState.steps : [];
       const latestFailureContext =
         runState?.latestFailureContext &&
@@ -16298,11 +16439,38 @@
       const stepRows = runtimeSteps.length
         ? runtimeSteps
             .map((step) => {
-              const tx = step?.txCounters ?? {
+              const queuedForStep = isReviewSubmitDashboard
+                ? queuedSubmissionsByStepId.get(String(step?.stepId)) ?? 0
+                : 0;
+              const baseTx = step?.txCounters ?? {
                 solved: 0,
                 skipped: 0,
                 failed: 0,
               };
+              const tx = isReviewSubmitDashboard
+                ? {
+                    solved: baseTx.solved ?? 0,
+                    skipped: queuedForStep,
+                    failed: baseTx.failed ?? 0,
+                  }
+                : baseTx;
+              const stepStatus = isReviewSubmitDashboard
+                ? isReviewSubmitted
+                  ? step?.status
+                  : queuedForStep > 0
+                  ? "waiting"
+                  : "skipped"
+                : step?.status;
+              const stepMessage = isReviewSubmitDashboard
+                ? isReviewSubmitted
+                  ? sanitizeDisplayText(step?.message) ?? "Submitted."
+                  : queuedForStep > 0
+                  ? `${queuedForStep} squad${queuedForStep === 1 ? "" : "s"} queued for submit.`
+                  : "No queued squads for this step."
+                : sanitizeDisplayText(step?.message) ?? "Pending.";
+              const stepStatsLine = isReviewSubmitDashboard
+                ? `Submitted ${tx.solved ?? 0} | Queued ${tx.skipped ?? 0} | Failed ${tx.failed ?? 0}`
+                : `Solved ${tx?.solved ?? 0} | Skipped ${tx?.skipped ?? 0} | Failed ${tx?.failed ?? 0}`;
               return `
                 <div class="ea-data-sequence-runtime-step">
                   <div class="ea-data-sequence-runtime-step-main">
@@ -16310,40 +16478,116 @@
                       sanitizeDisplayText(step?.label) ?? "Sequence Step",
                     )}</div>
                     <div class="ea-data-sequence-runtime-step-copy">${escapeHtml(
-                      sanitizeDisplayText(step?.message) ?? "Pending.",
+                      stepMessage,
                     )}</div>
                   </div>
                   <div class="ea-data-sequence-runtime-step-stats">
                     <div class="ea-data-sequence-step-badge" data-status="${escapeHtml(
-                      normalizeRunStatusKey(step?.status),
+                      normalizeRunStatusKey(stepStatus),
                     )}">${escapeHtml(
-                      sanitizeDisplayText(step?.status) ?? "pending",
+                      sanitizeDisplayText(stepStatus) ?? "pending",
                     )}</div>
-                    <div class="ea-data-sequence-runtime-step-stats-line">Solved ${tx?.solved ?? 0} | Skipped ${tx?.skipped ?? 0} | Failed ${tx?.failed ?? 0}</div>
+                    <div class="ea-data-sequence-runtime-step-stats-line">${escapeHtml(
+                      stepStatsLine,
+                    )}</div>
                   </div>
                 </div>
               `;
             })
             .join("")
         : '<div class="ea-data-sequence-empty">Run status will appear here once you start a sequence.</div>';
+      const canSwitchSubmitMode =
+        Boolean(activePlan) && !Boolean(state?.running) && !isReviewReady;
+      const reviewModeMeta = getSequenceSubmitModeMeta(
+        SEQUENCE_SUBMIT_MODE_REVIEW_FIRST,
+      );
+      const liveModeMeta = getSequenceSubmitModeMeta(
+        SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL,
+      );
+      const nextModeCopy =
+        planSubmitModeMeta.mode === SEQUENCE_SUBMIT_MODE_REVIEW_FIRST
+          ? "Next run solves the plan first, shows the planned players, then waits for submit."
+          : "Next run submits each solved squad immediately before moving to the next challenge.";
+      const modeSwitchMarkup = activePlan
+        ? `
+            <div class="ea-data-sequence-exec-mode-switch" data-disabled="${
+              canSwitchSubmitMode ? "false" : "true"
+            }">
+              <div class="ea-data-sequence-exec-mode-switch__label">Next Run Mode</div>
+              <div class="ea-data-sequence-exec-mode-switch__copy">${escapeHtml(
+                nextModeCopy,
+              )}</div>
+              <div class="ea-data-sequence-exec-mode-switch__buttons">
+                <button type="button" class="ea-data-sequence-exec-mode-btn${
+                  planSubmitModeMeta.mode === SEQUENCE_SUBMIT_MODE_REVIEW_FIRST
+                    ? " is-active"
+                    : ""
+                }" data-sequence-mode-action="${escapeHtml(
+                  SEQUENCE_SUBMIT_MODE_REVIEW_FIRST,
+                )}" ${canSwitchSubmitMode ? "" : "disabled"}>${escapeHtml(
+                  reviewModeMeta.shortLabel,
+                )}</button>
+                <button type="button" class="ea-data-sequence-exec-mode-btn${
+                  planSubmitModeMeta.mode === SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL
+                    ? " is-active"
+                    : ""
+                }" data-sequence-mode-action="${escapeHtml(
+                  SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL,
+                )}" ${canSwitchSubmitMode ? "" : "disabled"}>${escapeHtml(
+                  liveModeMeta.shortLabel,
+                )}</button>
+              </div>
+            </div>
+          `
+        : "";
       return `
         <div class="ea-data-sequence-surface">
           <div class="ea-data-sequence-surface__head">
             <div>
               <div class="ea-data-sequence-surface__title">Execution</div>
-              <div class="ea-data-sequence-surface__copy">Live progress, results, and submitted-player summary.</div>
+              <div class="ea-data-sequence-surface__copy">${escapeHtml(
+                runSubmitModeMeta.mode === SEQUENCE_SUBMIT_MODE_REVIEW_FIRST &&
+                  !isCompletedRun
+                  ? "Live progress, results, and planned-player summary."
+                  : "Live progress, results, and submitted-player summary.",
+              )}</div>
             </div>
-            <div class="ea-data-sequence-run-badge" data-status="${escapeHtml(
-              runBadgeStatus,
-            )}">${escapeHtml(statusText)}</div>
+            <div class="ea-data-sequence-runtime-head-actions">
+              <div class="ea-data-sequence-mode-badge">${escapeHtml(
+                runSubmitModeMeta.shortLabel,
+              )}</div>
+              <div class="ea-data-sequence-run-badge" data-status="${escapeHtml(
+                runBadgeStatus,
+              )}">${escapeHtml(runBadgeLabel)}</div>
+            </div>
           </div>
           <div class="ea-data-sequence-runtime">
+            ${
+              isReviewReady
+                ? `<div class="ea-data-sequence-submit-ready">
+                    <div>
+                      <div class="ea-data-sequence-submit-ready__title">Solved squads are ready</div>
+                      <div class="ea-data-sequence-submit-ready__copy">Review the planned player list, then submit every queued challenge in order.</div>
+                    </div>
+                    <button type="button" class="ea-data-btn ea-data-btn--success" data-sequence-submit-action="submit">Submit Solved Squads</button>
+                  </div>`
+                : ""
+            }
+            ${modeSwitchMarkup}
             <div class="ea-data-sequence-progress">
               <div class="ea-data-sequence-progress-meta">
                 <span>${escapeHtml(
                   plannedChallenges > 0
-                    ? `${processedChallenges}/${plannedChallenges} challenge attempts`
-                    : `${processedChallenges} challenge attempts`,
+                    ? `${processedChallenges}/${plannedChallenges} ${
+                        isReviewSubmitDashboard
+                          ? "submissions"
+                          : "challenge attempts"
+                      }`
+                    : `${processedChallenges} ${
+                        isReviewSubmitDashboard
+                          ? "submissions"
+                          : "challenge attempts"
+                      }`,
                 )}</span>
                 <span>${escapeHtml(`${progressPct}%`)}</span>
               </div>
@@ -16364,21 +16608,27 @@
             </div>
             <div class="ea-data-sequence-runtime-counters">
               <div class="ea-data-sequence-counter">
-                <div class="ea-data-sequence-counter-label">Solved</div>
+                <div class="ea-data-sequence-counter-label">${escapeHtml(
+                  displayCounterLabels.solved,
+                )}</div>
                 <div class="ea-data-sequence-counter-value">${escapeHtml(
-                  counters?.solved ?? 0,
+                  displayCounters?.solved ?? 0,
                 )}</div>
               </div>
               <div class="ea-data-sequence-counter">
-                <div class="ea-data-sequence-counter-label">Skipped</div>
+                <div class="ea-data-sequence-counter-label">${escapeHtml(
+                  displayCounterLabels.skipped,
+                )}</div>
                 <div class="ea-data-sequence-counter-value">${escapeHtml(
-                  counters?.skipped ?? 0,
+                  displayCounters?.skipped ?? 0,
                 )}</div>
               </div>
               <div class="ea-data-sequence-counter">
-                <div class="ea-data-sequence-counter-label">Failed</div>
+                <div class="ea-data-sequence-counter-label">${escapeHtml(
+                  displayCounterLabels.failed,
+                )}</div>
                 <div class="ea-data-sequence-counter-value">${escapeHtml(
-                  counters?.failed ?? 0,
+                  displayCounters?.failed ?? 0,
                 )}</div>
               </div>
             </div>
@@ -16386,7 +16636,9 @@
             <div class="ea-data-sequence-used-list">${usedEntriesMarkup}</div>
             <div class="ea-data-used-summary">
               <div class="ea-data-used-summary-top">
-                <div class="ea-data-used-summary-title">Submitted Ratings</div>
+                <div class="ea-data-used-summary-title">${escapeHtml(
+                  usedRatingsTitle,
+                )}</div>
                 <div class="ea-data-preview-right">
                   <span class="ea-data-pill">Players ${escapeHtml(
                     usedSummary?.playerCount ?? 0,
@@ -16420,6 +16672,13 @@
       const planLoops = clampSequenceLoopCount(
         plan?.policy?.planLoopCount ?? 1,
         1,
+      );
+      const submitMode = normalizeSequenceSubmitMode(plan?.policy?.submitMode);
+      const reviewModeMeta = getSequenceSubmitModeMeta(
+        SEQUENCE_SUBMIT_MODE_REVIEW_FIRST,
+      );
+      const liveModeMeta = getSequenceSubmitModeMeta(
+        SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL,
       );
       settingsPanelEl.innerHTML = `
         <div class="ea-data-sequence-surface">
@@ -16457,9 +16716,47 @@
             </div>
             <div class="ea-data-sequence-field">
               <span class="ea-data-sequence-label">How It Runs</span>
-              <div class="ea-data-sequence-step-target-copy">Skips challenges that have no solution.</div>
-              <div class="ea-data-sequence-step-target-copy">Stops if the web app returns a hard error.</div>
-              <div class="ea-data-sequence-step-target-copy">Uses one shared player pool across the whole sequence.</div>
+              <div class="ea-data-sequence-mode-grid">
+                <label class="ea-data-sequence-mode-option" data-selected="${
+                  submitMode === SEQUENCE_SUBMIT_MODE_REVIEW_FIRST
+                    ? "true"
+                    : "false"
+                }">
+                  <input type="radio" name="ea-data-sequence-submit-mode" value="${escapeHtml(
+                    SEQUENCE_SUBMIT_MODE_REVIEW_FIRST,
+                  )}" ${
+                    submitMode === SEQUENCE_SUBMIT_MODE_REVIEW_FIRST
+                      ? "checked"
+                      : ""
+                  } ${isRunning ? "disabled" : ""} />
+                  <span class="ea-data-sequence-mode-option__title">${escapeHtml(
+                    reviewModeMeta.label,
+                  )}</span>
+                  <span class="ea-data-sequence-mode-option__copy">${escapeHtml(
+                    reviewModeMeta.copy,
+                  )}</span>
+                </label>
+                <label class="ea-data-sequence-mode-option" data-selected="${
+                  submitMode === SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL
+                    ? "true"
+                    : "false"
+                }">
+                  <input type="radio" name="ea-data-sequence-submit-mode" value="${escapeHtml(
+                    SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL,
+                  )}" ${
+                    submitMode === SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL
+                      ? "checked"
+                      : ""
+                  } ${isRunning ? "disabled" : ""} />
+                  <span class="ea-data-sequence-mode-option__title">${escapeHtml(
+                    liveModeMeta.label,
+                  )}</span>
+                  <span class="ea-data-sequence-mode-option__copy">${escapeHtml(
+                    liveModeMeta.copy,
+                  )}</span>
+                </label>
+              </div>
+              <div class="ea-data-sequence-step-target-copy">Skips challenges that have no solution, stops on hard web app errors, and uses one shared player pool across the sequence.</div>
               <div class="ea-data-sequence-step-target-copy">Updated ${escapeHtml(
                 formatShortDate(plan?.updatedAt),
               )}</div>
@@ -16953,11 +17250,19 @@
       const invalidEnabledCount =
         validationSummary?.invalidEnabledSteps?.length ?? 0;
       const dirty = Boolean(state?.dirty);
+      const submitModeMeta = getSequenceSubmitModeMeta(
+        activePlan?.policy?.submitMode,
+      );
+      const reviewReady =
+        normalizeRunStatusKey(state?.runState?.status) === "ready_to_submit" &&
+        (state?.pendingSequenceSubmissions?.length ?? 0) > 0;
       planBadgeEl.textContent = dirty ? "Unsaved" : "Saved";
       planBadgeEl.classList.toggle("ea-data-sequence-badge--accent", dirty);
       runBadgeEl.textContent =
-        sanitizeDisplayText(state?.runState?.status) ??
-        (isRunning ? "Running" : "Idle");
+        reviewReady
+          ? "Ready To Submit"
+          : sanitizeDisplayText(state?.runState?.status) ??
+            (isRunning ? "Running" : "Idle");
       runBadgeEl.setAttribute(
         "data-status",
         normalizeRunStatusKey(state?.runState?.status ?? "idle"),
@@ -16967,11 +17272,18 @@
       newBtn.disabled = isRunning;
       addStepFooterBtn.disabled = isRunning || !hasPlan;
       startBtn.disabled =
-        isRunning || !hasPlan || enabledSteps <= 0 || invalidEnabledCount > 0;
+        isRunning ||
+        (!reviewReady &&
+          (!hasPlan || enabledSteps <= 0 || invalidEnabledCount > 0));
+      startBtn.textContent = reviewReady
+        ? "Submit Solved Squads"
+        : submitModeMeta.actionLabel;
       stopBtn.classList.toggle("ea-data-is-hidden", !isRunning);
       stopBtn.disabled = !isRunning || Boolean(state?.abortRequested);
       startBtn.style.display = isRunning ? "none" : "";
-      if (dirty) {
+      if (reviewReady) {
+        setToolbarStatus("Solved squads are ready to submit.");
+      } else if (dirty) {
         setToolbarStatus("Unsaved changes.");
       } else if (invalidEnabledCount > 0) {
         setToolbarStatus(
@@ -17070,8 +17382,21 @@
       });
     };
 
+    const clearPendingSequenceReview = () => {
+      const state = sequenceSolveOverlayState;
+      if (!state) return;
+      state.pendingSequenceSubmissions = [];
+      state.pendingSequenceRunContext = null;
+      state.usedSummaryIndex = 0;
+      if (normalizeRunStatusKey(state?.runState?.status) === "ready_to_submit") {
+        state.runState = null;
+        state.runtimeStatusText = "";
+      }
+    };
+
     const createPlan = async () => {
       const state = sequenceSolveOverlayState;
+      clearPendingSequenceReview();
       const index = Math.max(1, (state?.plans?.length ?? 0) + 1);
       const plan = createDefaultSequencePlan({
         name: `Sequence Plan ${index}`,
@@ -17089,6 +17414,7 @@
 
     const deleteActivePlan = async (planId = null) => {
       const state = sequenceSolveOverlayState;
+      clearPendingSequenceReview();
       const active =
         (Array.isArray(state?.plans) ? state.plans : []).find(
           (plan) =>
@@ -17193,7 +17519,17 @@
       render();
     };
 
-    const createEmptyRunUsedSummary = () => ({
+    const createEmptyRunUsedSummary = ({
+      summaryLabel = "Submitted Players",
+      ratingsLabel = "Submitted Ratings",
+      emptyPlayersLabel = "No submitted players yet",
+    } = {}) => ({
+      summaryLabel:
+        sanitizeDisplayText(summaryLabel) ?? "Submitted Players",
+      ratingsLabel:
+        sanitizeDisplayText(ratingsLabel) ?? "Submitted Ratings",
+      emptyPlayersLabel:
+        sanitizeDisplayText(emptyPlayersLabel) ?? "No submitted players yet",
       playerCount: 0,
       specialCount: 0,
       ratings: {},
@@ -17285,7 +17621,9 @@
         return;
       }
       if (!runState.usedSummary || typeof runState.usedSummary !== "object") {
-        runState.usedSummary = createEmptyRunUsedSummary();
+        runState.usedSummary = createEmptyRunUsedSummary(
+          getSequenceSubmitModeMeta(runState?.submitMode),
+        );
       }
       const summary = runState.usedSummary;
       if (!summary.ratings || typeof summary.ratings !== "object") {
@@ -17384,7 +17722,12 @@
       },
       plannedChallenges:
         Math.max(0, Math.floor(readNumeric(plannedChallenges) ?? 0)) || 0,
-      usedSummary: createEmptyRunUsedSummary(),
+      submitMode: normalizeSequenceSubmitMode(plan?.policy?.submitMode),
+      executionPhase: "solving",
+      submissionTotal: 0,
+      usedSummary: createEmptyRunUsedSummary(
+        getSequenceSubmitModeMeta(plan?.policy?.submitMode),
+      ),
       firstError: null,
       stopReason: null,
       latestFailureContext: null,
@@ -17551,14 +17894,280 @@
       };
     };
 
+    const submitSequenceSolvedDescriptor = async (
+      plannedSubmission,
+      runContext,
+      {
+        onPhaseChange = null,
+        progressAttemptKey = null,
+        buildFailureContext = null,
+        recordUsage = true,
+        updateUsedPool = true,
+        useStoredChallenge = true,
+      } = {},
+    ) => {
+      const shouldAbort = () =>
+        Boolean(sequenceSolveOverlayState?.abortRequested);
+      const descriptor = plannedSubmission?.descriptor ?? null;
+      const step = plannedSubmission?.step ?? null;
+      const challengeName =
+        sanitizeDisplayText(
+          plannedSubmission?.challengeName ?? descriptor?.challengeName,
+        ) ?? "Challenge";
+      const solutionIds = Array.isArray(plannedSubmission?.solutionIds)
+        ? plannedSubmission.solutionIds
+        : [];
+      const notifyPhase = (phase, message) => {
+        markRunProgressPhase(
+          sequenceSolveOverlayState?.runState,
+          progressAttemptKey,
+          phase,
+        );
+        if (typeof onPhaseChange !== "function") return;
+        try {
+          onPhaseChange(phase, message);
+        } catch {}
+      };
+      const makeFailureContext =
+        typeof buildFailureContext === "function"
+          ? buildFailureContext
+          : ({
+              source = "submit",
+              reason = null,
+              phase = null,
+              failingRequirements = [],
+            } = {}) =>
+              createSequenceRuntimeFailureContext({
+                source,
+                reason,
+                challengeId: descriptor?.challengeId ?? null,
+                challengeName: descriptor?.challengeName ?? challengeName,
+                stepId: step?.id ?? null,
+                stepLabel:
+                  sanitizeDisplayText(plannedSubmission?.stepLabel) ??
+                  sanitizeDisplayText(
+                    sequenceSolveOverlayState?.runState?.currentStepLabel,
+                  ) ??
+                  null,
+                phase,
+                failingRequirements,
+              });
+
+      let challengeEntity =
+        useStoredChallenge && plannedSubmission?.challengeEntity
+          ? plannedSubmission.challengeEntity
+          : null;
+      if (!challengeEntity) {
+        notifyPhase("refreshing", `Refreshing ${challengeName}...`);
+        challengeEntity = await getChallengeEntityForSubmission(
+          descriptor?.setId,
+          descriptor?.challengeId,
+          descriptor?.challengeName,
+        );
+      }
+      if (!challengeEntity) {
+        const message = `${challengeName} is no longer available.`;
+        markRunProgressPhase(
+          sequenceSolveOverlayState?.runState,
+          progressAttemptKey,
+          "failed",
+        );
+        return {
+          status: "failed",
+          code: "STEP_DATA_STALE",
+          message,
+          failureContext: makeFailureContext({
+            source: "challenge-data",
+            reason: message,
+            phase: "refreshing",
+          }),
+        };
+      }
+
+      let hydratedChallenge = challengeEntity;
+      if (!hydratedChallenge?.squad || !useStoredChallenge) {
+        notifyPhase("loading", `Loading ${challengeName}...`);
+        try {
+          const loaded = await loadChallenge(hydratedChallenge, true, {
+            force: true,
+          });
+          if (!hydratedChallenge?.squad && loaded?.squad) {
+            try {
+              hydratedChallenge.squad = loaded.squad;
+            } catch {}
+          }
+          if (!hydratedChallenge?.squad && loaded?.data?.squad) {
+            try {
+              hydratedChallenge.squad = loaded.data.squad;
+            } catch {}
+          }
+        } catch (error) {
+          const message =
+            sanitizeDisplayText(error?.message) ??
+            `${challengeName} could not be loaded.`;
+          markRunProgressPhase(
+            sequenceSolveOverlayState?.runState,
+            progressAttemptKey,
+            "failed",
+          );
+          return {
+            status: "failed",
+            code: "LOAD_FAILED",
+            message,
+            failureContext: makeFailureContext({
+              source: "challenge-data",
+              reason: message,
+              phase: "loading",
+            }),
+          };
+        }
+      }
+      if (!hydratedChallenge?.squad) {
+        const message = `${challengeName} has no open squad after loading.`;
+        markRunProgressPhase(
+          sequenceSolveOverlayState?.runState,
+          progressAttemptKey,
+          "failed",
+        );
+        return {
+          status: "failed",
+          code: "LOAD_FAILED",
+          message,
+          failureContext: makeFailureContext({
+            source: "challenge-data",
+            reason: message,
+            phase: "loading",
+          }),
+        };
+      }
+
+      notifyPhase("applying", `Applying ${challengeName}...`);
+      try {
+        await applySolutionWithSelectedMode(hydratedChallenge, solutionIds, {
+          lookupKey: "id",
+          slotSolution: plannedSubmission?.slotSolution ?? null,
+          playerById:
+            runContext?.playerById ??
+            plannedSubmission?.playerById ??
+            null,
+          preserveExistingValid: false,
+          preHydratedChallenge: Boolean(hydratedChallenge?.squad),
+        });
+        await delayMs(jitterMs(350, 0.35));
+      } catch (error) {
+        const message =
+          sanitizeDisplayText(error?.message) ??
+          `${challengeName} could not be applied.`;
+        markRunProgressPhase(
+          sequenceSolveOverlayState?.runState,
+          progressAttemptKey,
+          "failed",
+        );
+        return {
+          status: "failed",
+          code: "APPLY_FAILED",
+          message,
+          failureContext: makeFailureContext({
+            source: "system",
+            reason: message,
+            phase: "applying",
+          }),
+        };
+      }
+
+      notifyPhase("submitting", `Submitting ${challengeName}...`);
+      let submitResult = null;
+      try {
+        submitResult = await submitSbcChallenge(hydratedChallenge);
+      } catch (error) {
+        const message =
+          sanitizeDisplayText(error?.message) ??
+          `${challengeName} submit failed.`;
+        markRunProgressPhase(
+          sequenceSolveOverlayState?.runState,
+          progressAttemptKey,
+          "failed",
+        );
+        return {
+          status: "failed",
+          code: "SUBMIT_FAILED",
+          message,
+          failureContext: makeFailureContext({
+            source: "submit",
+            reason: message,
+            phase: "submitting",
+          }),
+        };
+      }
+      if (!submitResult?.success) {
+        const errorCode =
+          submitResult?.error ?? submitResult?.status ?? "unknown";
+        const reason = `Submit failed (${errorCode}).`;
+        markRunProgressPhase(
+          sequenceSolveOverlayState?.runState,
+          progressAttemptKey,
+          "failed",
+        );
+        return {
+          status: "failed",
+          code: "SUBMIT_FAILED",
+          message: `${challengeName} ${reason}`,
+          failureContext: makeFailureContext({
+            source: "submit",
+            reason,
+            phase: "submitting",
+          }),
+        };
+      }
+
+      if (recordUsage) {
+        recordRunUsedPlayers(solutionIds, runContext, {
+          descriptor,
+          step,
+          stepLabel:
+            sanitizeDisplayText(plannedSubmission?.stepLabel) ??
+            sanitizeDisplayText(
+              sequenceSolveOverlayState?.runState?.currentStepLabel,
+            ) ??
+            sanitizeDisplayText(descriptor?.challengeName) ??
+            null,
+          slotSolution: plannedSubmission?.slotSolution ?? null,
+          slotIndexToPositionName:
+            plannedSubmission?.slotIndexToPositionName ?? null,
+        });
+      }
+      if (updateUsedPool && runContext?.usedPlayerIds?.add) {
+        for (const id of solutionIds) {
+          if (id == null) continue;
+          runContext.usedPlayerIds.add(String(id));
+        }
+      }
+      clearSetChallengeInfoPrefetchCache(descriptor?.setId);
+      try {
+        const setEntity = await ensureSbcSetById(descriptor?.setId);
+        await refreshSbcSetChallengesSnapshot(descriptor?.setId, setEntity);
+      } catch {}
+      if (!shouldAbort()) {
+        await delayMs(jitterMs(2200, 0.2));
+      }
+      markRunProgressPhase(
+        sequenceSolveOverlayState?.runState,
+        progressAttemptKey,
+        "solved",
+      );
+      return {
+        status: "solved",
+        code: "SOLVED",
+        message: `${challengeName} submitted successfully.`,
+      };
+    };
+
     const executeDescriptor = async (
       descriptor,
       step,
       runContext,
-      { onPhaseChange = null } = {},
+      { onPhaseChange = null, submit = true } = {},
     ) => {
-      const shouldAbort = () =>
-        Boolean(sequenceSolveOverlayState?.abortRequested);
       const challengeName = descriptor?.challengeName ?? "Challenge";
       const progressAttemptKey = buildSequenceProgressAttemptKey({
         planPass: runContext?.currentPlanPass,
@@ -17832,114 +18441,58 @@
         };
       }
 
-      notifyPhase("applying", `Applying ${challengeName}...`);
-      try {
-        await applySolutionWithSelectedMode(challengeEntity, solutionIds, {
-          lookupKey: "id",
-          slotSolution: solveResult?.solutionSlots?.[0] ?? null,
-          playerById: runContext?.playerById ?? null,
-          preserveExistingValid: false,
-          preHydratedChallenge: true,
-        });
-        await delayMs(jitterMs(350, 0.35));
-      } catch (error) {
-        const message =
-          sanitizeDisplayText(error?.message) ??
-          `${challengeName} could not be applied.`;
-        markRunProgressPhase(
-          sequenceSolveOverlayState?.runState,
-          progressAttemptKey,
-          "failed",
-        );
-        return {
-          status: "failed",
-          code: "APPLY_FAILED",
-          message,
-          failureContext: buildFailureContext({
-            source: "system",
-            reason: message,
-            phase: "applying",
-          }),
-        };
-      }
-
-      notifyPhase("submitting", `Submitting ${challengeName}...`);
-      let submitResult = null;
-      try {
-        submitResult = await submitSbcChallenge(challengeEntity);
-      } catch (error) {
-        const message =
-          sanitizeDisplayText(error?.message) ??
-          `${challengeName} submit failed.`;
-        markRunProgressPhase(
-          sequenceSolveOverlayState?.runState,
-          progressAttemptKey,
-          "failed",
-        );
-        return {
-          status: "failed",
-          code: "SUBMIT_FAILED",
-          message,
-          failureContext: buildFailureContext({
-            source: "submit",
-            reason: message,
-            phase: "submitting",
-          }),
-        };
-      }
-      if (!submitResult?.success) {
-        const errorCode = submitResult?.error ?? submitResult?.status ?? "unknown";
-        const reason = `Submit failed (${errorCode}).`;
-        markRunProgressPhase(
-          sequenceSolveOverlayState?.runState,
-          progressAttemptKey,
-          "failed",
-        );
-        return {
-          status: "failed",
-          code: "SUBMIT_FAILED",
-          message: `${challengeName} ${reason}`,
-          failureContext: buildFailureContext({
-            source: "submit",
-            reason,
-            phase: "submitting",
-          }),
-        };
-      }
-
-      recordRunUsedPlayers(solutionIds, runContext, {
-        descriptor,
+      const plannedSubmission = {
+        descriptor: descriptor ? { ...descriptor } : null,
         step,
+        challengeName,
+        challengeEntity,
+        solutionIds: solutionIds.slice(),
+        slotSolution: solveResult?.solutionSlots?.[0] ?? null,
+        slotIndexToPositionName: slotInfo?.slotIndexToPositionName ?? null,
+        planPass: runContext?.currentPlanPass ?? null,
+        stepLoopPass: runContext?.currentStepLoopPass ?? null,
         stepLabel:
           sanitizeDisplayText(runContext?.currentStepLabel) ??
           sanitizeDisplayText(sequenceSolveOverlayState?.runState?.currentStepLabel) ??
           sanitizeDisplayText(descriptor?.challengeName) ??
           null,
-        slotSolution: solveResult?.solutionSlots?.[0] ?? null,
-        slotIndexToPositionName: slotInfo?.slotIndexToPositionName ?? null,
-      });
-      for (const id of solutionIds) {
-        if (id == null) continue;
-        runContext.usedPlayerIds.add(String(id));
-      }
-      clearSetChallengeInfoPrefetchCache(descriptor?.setId);
-      try {
-        const setEntity = await ensureSbcSetById(descriptor?.setId);
-        await refreshSbcSetChallengesSnapshot(descriptor?.setId, setEntity);
-      } catch {}
-      if (!shouldAbort()) {
-        await delayMs(jitterMs(2200, 0.2));
-      }
-      markRunProgressPhase(
-        sequenceSolveOverlayState?.runState,
-        progressAttemptKey,
-        "solved",
-      );
-      return {
-        status: "solved",
-        code: "SOLVED",
-        message: `${challengeName} submitted successfully.`,
+        playerById: runContext?.playerById ?? null,
       };
+
+      if (!submit) {
+        recordRunUsedPlayers(solutionIds, runContext, {
+          descriptor,
+          step,
+          stepLabel: plannedSubmission.stepLabel,
+          slotSolution: plannedSubmission.slotSolution,
+          slotIndexToPositionName: plannedSubmission.slotIndexToPositionName,
+        });
+        for (const id of solutionIds) {
+          if (id == null) continue;
+          runContext.usedPlayerIds.add(String(id));
+        }
+        markRunProgressPhase(
+          sequenceSolveOverlayState?.runState,
+          progressAttemptKey,
+          "solved",
+        );
+        return {
+          status: "solved",
+          code: "SOLVED",
+          message: `${challengeName} solved and queued for review.`,
+          reviewPending: true,
+          plannedSubmission,
+        };
+      }
+
+      return submitSequenceSolvedDescriptor(plannedSubmission, runContext, {
+        onPhaseChange: notifyPhase,
+        progressAttemptKey,
+        buildFailureContext,
+        recordUsage: true,
+        updateUsedPool: true,
+        useStoredChallenge: true,
+      });
     };
 
     const runActivePlan = async () => {
@@ -17958,9 +18511,16 @@
         activePlan?.policy?.planLoopCount ?? 1,
         1,
       );
+      const submitMode = normalizeSequenceSubmitMode(
+        activePlan?.policy?.submitMode,
+      );
+      const reviewFirst =
+        submitMode === SEQUENCE_SUBMIT_MODE_REVIEW_FIRST;
 
       sequenceSolveOverlayState.usedSummaryIndex = 0;
       sequenceSolveOverlayState.runState = buildInitialRunState(activePlan);
+      sequenceSolveOverlayState.pendingSequenceSubmissions = [];
+      sequenceSolveOverlayState.pendingSequenceRunContext = null;
       sequenceSolveOverlayState.runtimeStatusText = "Preparing solver...";
       sequenceSolveOverlayState.running = true;
       sequenceSolveOverlayState.abortRequested = false;
@@ -18076,6 +18636,7 @@
               .filter(Boolean),
           ),
         };
+        sequenceSolveOverlayState.pendingSequenceRunContext = runContext;
 
         let noWorkStopReason = null;
         planLoop: for (
@@ -18179,6 +18740,7 @@
                     step,
                     runContext,
                     {
+                      submit: !reviewFirst,
                       onPhaseChange: (phase, message) => {
                         const baseMessage =
                           sanitizeDisplayText(message) ??
@@ -18196,6 +18758,11 @@
                     },
                   );
                   if (outcome?.status === "solved") {
+                    if (reviewFirst && outcome?.plannedSubmission) {
+                      sequenceSolveOverlayState.pendingSequenceSubmissions.push(
+                        outcome.plannedSubmission,
+                      );
+                    }
                     bumpRunCounters("solved", step.id);
                     solvedThisPlanPass += 1;
                     solvedThisStepLoop += 1;
@@ -18310,8 +18877,32 @@
           sequenceSolveOverlayState.runState.stopReason =
             terminalState.stopReason;
         }
+        if (
+          reviewFirst &&
+          (sequenceSolveOverlayState.runState.status === "completed" ||
+            sequenceSolveOverlayState.runState.status === "partial") &&
+          (sequenceSolveOverlayState.pendingSequenceSubmissions?.length ?? 0) > 0
+        ) {
+          sequenceSolveOverlayState.runState.status = "ready_to_submit";
+          sequenceSolveOverlayState.runState.executionPhase = "review_ready";
+          sequenceSolveOverlayState.runState.submissionTotal =
+            sequenceSolveOverlayState.pendingSequenceSubmissions?.length ?? 0;
+          sequenceSolveOverlayState.runState.stopReason =
+            sequenceSolveOverlayState.runState.hadSoftFailures
+              ? sequenceSolveOverlayState.runState.stopReason
+              : "Review solved squads before submitting.";
+          sequenceSolveOverlayState.runtimeStatusText =
+            "Solved squads are ready to review and submit.";
+        }
 
-        if (sequenceSolveOverlayState.runState.status === "completed") {
+        if (sequenceSolveOverlayState.runState.status === "ready_to_submit") {
+          showToast({
+            type: "success",
+            title: "Sequence Ready",
+            message: `Solved ${sequenceSolveOverlayState.runState.counters.solved} squad${sequenceSolveOverlayState.runState.counters.solved === 1 ? "" : "s"} for review.`,
+            timeoutMs: 7000,
+          });
+        } else if (sequenceSolveOverlayState.runState.status === "completed") {
           showToast({
             type: "success",
             title: "Sequence Complete",
@@ -18374,6 +18965,231 @@
         showToast({
           type: "error",
           title: "Sequence Failed",
+          message,
+          timeoutMs: 8000,
+        });
+      } finally {
+        exitSbcAutomation();
+        sequenceSolveOverlayState.running = false;
+        render();
+      }
+    };
+
+    const submitPendingSequencePlan = async () => {
+      if (sequenceSolveOverlayState?.running) return;
+      const pending = Array.isArray(
+        sequenceSolveOverlayState?.pendingSequenceSubmissions,
+      )
+        ? sequenceSolveOverlayState.pendingSequenceSubmissions
+        : [];
+      if (!pending.length) {
+        showToast({
+          type: "info",
+          title: "Nothing To Submit",
+          message: "Solve the sequence plan first.",
+          timeoutMs: 4500,
+        });
+        return;
+      }
+      const runState = sequenceSolveOverlayState?.runState ?? null;
+      const runContext =
+        sequenceSolveOverlayState?.pendingSequenceRunContext ?? {};
+      sequenceSolveOverlayState.running = true;
+      sequenceSolveOverlayState.abortRequested = false;
+      sequenceSolveOverlayState.runtimeStatusText =
+        "Submitting queued sequence squads...";
+      if (runState) {
+        runState.status = "running";
+        runState.stopReason = null;
+        runState.submitMode = SEQUENCE_SUBMIT_MODE_REVIEW_FIRST;
+        runState.executionPhase = "submitting";
+        runState.submissionTotal = pending.length;
+        runState.plannedChallenges = pending.length;
+        runState.completedProgressUnits = 0;
+        runState.progressPhaseByAttempt = {};
+        runState.counters = {
+          solved: 0,
+          skipped: 0,
+          failed: 0,
+        };
+        const queuedStepIds = new Set(
+          pending
+            .map((entry) => entry?.step?.id ?? null)
+            .filter((value) => value != null)
+            .map(String),
+        );
+        if (Array.isArray(runState.steps)) {
+          for (const stepEntry of runState.steps) {
+            const queued = queuedStepIds.has(String(stepEntry?.stepId));
+            stepEntry.status = queued ? "waiting" : "skipped";
+            stepEntry.message = queued
+              ? "Queued for submit."
+              : "No queued squads for this step.";
+            stepEntry.txCounters = {
+              solved: 0,
+              skipped: 0,
+              failed: 0,
+            };
+          }
+        }
+        if (runState.usedSummary && typeof runState.usedSummary === "object") {
+          runState.usedSummary.summaryLabel = "Planned Players";
+          runState.usedSummary.ratingsLabel = "Planned Ratings";
+          runState.usedSummary.emptyPlayersLabel = "No planned players yet";
+        }
+      }
+      render();
+
+      let submittedCount = 0;
+      let hardFailure = null;
+      try {
+        enterSbcAutomation();
+        const bridgeReady = await initSolverBridge();
+        if (!bridgeReady) {
+          throw new Error("Solver bridge is not ready.");
+        }
+        while (pending.length) {
+          if (sequenceSolveOverlayState.abortRequested) {
+            if (runState) {
+              runState.status = "stopped";
+              runState.stopReason = "Stopped by user at a safe boundary.";
+            }
+            break;
+          }
+          const planned = pending[0];
+          const descriptor = planned?.descriptor ?? null;
+          const step = planned?.step ?? null;
+          const submitAttemptIndex =
+            submittedCount + (readNumeric(runState?.counters?.failed) ?? 0) + 1;
+          const progressAttemptKey = [
+            "submit",
+            sanitizeDisplayText(runState?.runId) ?? "run",
+            submitAttemptIndex,
+            sanitizeDisplayText(step?.id) ?? "step",
+            sanitizeDisplayText(
+              descriptor?.challengeId ??
+                descriptor?.challengeIndex ??
+                descriptor?.challengeName,
+            ) ?? "challenge",
+          ].join("::");
+          const stepLabel =
+            sanitizeDisplayText(planned?.stepLabel) ??
+            sanitizeDisplayText(runState?.currentStepLabel) ??
+            "Sequence Step";
+          setRunProgress({
+            stepId: step?.id ?? null,
+            stepLabel,
+          });
+          updateRunStep(step?.id, {
+            status: "submitting",
+            message: `Submitting ${descriptor?.challengeName ?? "challenge"}...`,
+          });
+          const outcome = await submitSequenceSolvedDescriptor(
+            planned,
+            runContext,
+            {
+              progressAttemptKey,
+              recordUsage: false,
+              updateUsedPool: false,
+              useStoredChallenge: false,
+              onPhaseChange: (phase, message) => {
+                const displayMessage =
+                  sanitizeDisplayText(message) ??
+                  `${phase} ${descriptor?.challengeName ?? "challenge"}...`;
+                updateRunStep(step?.id, {
+                  status: phase,
+                  message: displayMessage,
+                });
+                setRuntimeStatus(displayMessage);
+              },
+            },
+          );
+          if (outcome?.status === "solved") {
+            submittedCount += 1;
+            pending.shift();
+            bumpRunCounters("solved", step?.id);
+            updateRunStep(step?.id, {
+              status: "solved",
+              message: outcome?.message ?? "Challenge submitted successfully.",
+            });
+            continue;
+          }
+          bumpRunCounters("failed", step?.id);
+          updateRunStep(step?.id, {
+            status: "failed",
+            message: outcome?.message ?? "Submit failed.",
+          });
+          hardFailure = {
+            message: outcome?.message ?? "Submit failed.",
+            failureContext: outcome?.failureContext ?? null,
+          };
+          break;
+        }
+
+        if (hardFailure) {
+          if (runState) {
+            runState.status = "failed";
+            runState.stopReason = hardFailure.message;
+          }
+          recordSequenceRuntimeFailure(
+            hardFailure.failureContext ??
+              createSequenceRuntimeFailureContext({
+                source: "submit",
+                reason: hardFailure.message,
+              }),
+            { setFirstError: true },
+          );
+          showToast({
+            type: "error",
+            title: "Sequence Submit Failed",
+            message: hardFailure.message,
+            timeoutMs: 8000,
+          });
+        } else if (runState?.status === "stopped") {
+          showToast({
+            type: "info",
+            title: "Sequence Submit Stopped",
+            message: runState.stopReason ?? "Stopped by user.",
+            timeoutMs: 6500,
+          });
+        } else if (!pending.length) {
+          if (runState) {
+            runState.status = "completed";
+            runState.executionPhase = "submitted";
+            runState.stopReason = null;
+            if (runState.usedSummary && typeof runState.usedSummary === "object") {
+              runState.usedSummary.summaryLabel = "Submitted Players";
+              runState.usedSummary.ratingsLabel = "Submitted Ratings";
+              runState.usedSummary.emptyPlayersLabel = "No submitted players yet";
+            }
+          }
+          sequenceSolveOverlayState.runtimeStatusText =
+            "Sequence submitted successfully.";
+          showToast({
+            type: "success",
+            title: "Sequence Submitted",
+            message: `Submitted ${submittedCount} queued squad${submittedCount === 1 ? "" : "s"}.`,
+            timeoutMs: 6500,
+          });
+        }
+      } catch (error) {
+        const message =
+          sanitizeDisplayText(error?.message) ??
+          "Sequence submit failed unexpectedly.";
+        if (runState) {
+          runState.status = "failed";
+          runState.stopReason = message;
+        }
+        recordSequenceRuntimeFailure(
+          createSequenceRuntimeFailureContext({
+            source: "system",
+            reason: message,
+          }),
+          { setFirstError: true },
+        );
+        showToast({
+          type: "error",
+          title: "Sequence Submit Failed",
           message,
           timeoutMs: 8000,
         });
@@ -18463,6 +19279,15 @@
       }
     });
     startBtn?.addEventListener("click", async () => {
+      if (
+        normalizeRunStatusKey(sequenceSolveOverlayState?.runState?.status) ===
+          "ready_to_submit" &&
+        (sequenceSolveOverlayState?.pendingSequenceSubmissions?.length ?? 0) > 0
+      ) {
+        switchTab("execution");
+        await submitPendingSequencePlan();
+        return;
+      }
       const activePlan = getActivePlan();
       const invalidEnabledSteps =
         getPlanValidation(activePlan)?.invalidEnabledSteps ?? [];
@@ -18513,6 +19338,7 @@
       const planCard = event?.target?.closest?.("[data-plan-id]");
       const planId = planCard?.getAttribute?.("data-plan-id");
       if (!planId || sequenceSolveOverlayState?.running) return;
+      clearPendingSequenceReview();
       sequenceSolveOverlayState.activePlanId = planId;
       const active = getActivePlan();
       if (active) {
@@ -18570,6 +19396,7 @@
       const target = event?.target ?? null;
       const activePlan = getActivePlan();
       if (!target || !activePlan) return;
+      clearPendingSequenceReview();
       if (target.id === "ea-data-sequence-plan-name") {
         activePlan.name = sanitizeDisplayText(target.value) ?? "Sequence Plan";
         touchPlans();
@@ -18580,6 +19407,15 @@
         activePlan.policy = normalizeSequencePolicy({
           ...(activePlan?.policy ?? {}),
           planLoopCount: target.value,
+        });
+        touchPlans();
+        render();
+        return;
+      }
+      if (target.name === "ea-data-sequence-submit-mode") {
+        activePlan.policy = normalizeSequencePolicy({
+          ...(activePlan?.policy ?? {}),
+          submitMode: target.value,
         });
         touchPlans();
         render();
@@ -18699,6 +19535,45 @@
     });
 
     executionPanelEl?.addEventListener("click", (event) => {
+      const modeBtn =
+        event?.target?.closest?.("[data-sequence-mode-action]") ?? null;
+      if (modeBtn) {
+        const activePlan = getActivePlan();
+        const reviewReady =
+          normalizeRunStatusKey(sequenceSolveOverlayState?.runState?.status) ===
+          "ready_to_submit";
+        if (!activePlan || sequenceSolveOverlayState?.running || reviewReady) {
+          return;
+        }
+        const nextMode = normalizeSequenceSubmitMode(
+          modeBtn.getAttribute("data-sequence-mode-action"),
+        );
+        const currentMode = normalizeSequenceSubmitMode(
+          activePlan?.policy?.submitMode,
+        );
+        if (nextMode !== currentMode) {
+          activePlan.policy = normalizeSequencePolicy({
+            ...(activePlan?.policy ?? {}),
+            submitMode: nextMode,
+          });
+          clearPendingSequenceReview();
+          touchPlans();
+          render();
+        }
+        return;
+      }
+      const submitBtn =
+        event?.target?.closest?.("[data-sequence-submit-action]") ?? null;
+      if (submitBtn) {
+        if (
+          !sequenceSolveOverlayState?.running &&
+          (sequenceSolveOverlayState?.pendingSequenceSubmissions?.length ?? 0) >
+            0
+        ) {
+          submitPendingSequencePlan();
+        }
+        return;
+      }
       const navBtn =
         event?.target?.closest?.("[data-sequence-used-action]") ?? null;
       if (!navBtn) return;
@@ -18761,6 +19636,8 @@
       abortRequested: false,
       runtimeStatusText: "",
       runState: null,
+      pendingSequenceSubmissions: [],
+      pendingSequenceRunContext: null,
       usedSummaryIndex: 0,
       loadingPromise: null,
       activeTab: "steps",
@@ -18775,6 +19652,7 @@
       loadPlans,
       savePlans,
       runActivePlan,
+      submitPendingSequencePlan,
     };
 
     if (!sequenceSolveOverlayKeyHandlerBound) {
@@ -21354,6 +22232,8 @@
   const SEQUENCE_TARGET_KIND_SET_SCOPE = "set_scope";
   const SEQUENCE_SET_SHAPE_SINGLE = "single";
   const SEQUENCE_SET_SHAPE_SET = "set";
+  const SEQUENCE_SUBMIT_MODE_REVIEW_FIRST = "review_first";
+  const SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL = "step_transactional";
 
   const createSequenceEntityId = (prefix = "sequence") => {
     const basePrefix =
@@ -21371,6 +22251,16 @@
     clampInt(value, SEQUENCE_LOOP_COUNT_MIN, SEQUENCE_LOOP_COUNT_MAX) ??
     clampInt(fallback, SEQUENCE_LOOP_COUNT_MIN, SEQUENCE_LOOP_COUNT_MAX) ??
     1;
+
+  const normalizeSequenceSubmitMode = (value) => {
+    const text = String(value ?? "")
+      .trim()
+      .toLowerCase();
+    if (text === SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL) {
+      return SEQUENCE_SUBMIT_MODE_STEP_TRANSACTIONAL;
+    }
+    return SEQUENCE_SUBMIT_MODE_REVIEW_FIRST;
+  };
 
   const getSequenceSetShape = (value) => {
     const text = String(value ?? "")
@@ -21480,7 +22370,7 @@
   const createDefaultSequencePolicy = () => ({
     failureMode: "hybrid",
     playerPool: "global_depletion",
-    submitMode: "step_transactional",
+    submitMode: SEQUENCE_SUBMIT_MODE_REVIEW_FIRST,
     planLoopCount: 1,
   });
 
@@ -21578,7 +22468,7 @@
       policy.playerPool = sanitizeDisplayText(raw.playerPool);
     }
     if (sanitizeDisplayText(raw?.submitMode)) {
-      policy.submitMode = sanitizeDisplayText(raw.submitMode);
+      policy.submitMode = normalizeSequenceSubmitMode(raw.submitMode);
     }
     policy.planLoopCount = clampSequenceLoopCount(
       raw?.planLoopCount ?? raw?.loopCount ?? raw?.loops ?? raw?.runs ?? 1,
