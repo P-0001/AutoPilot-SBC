@@ -6359,6 +6359,8 @@ const createSeedDescriptor = ({
   poolFilter = null,
   poolBias = null,
   prefillBias = null,
+  prefillGroups = null,
+  prefillPlayerIds = null,
   key = null,
   tier = 0,
 }) => {
@@ -6388,6 +6390,20 @@ const createSeedDescriptor = ({
       attr && groupId != null
         ? { axis, groupId, strength: Math.max(1, toNumber(strength) ?? 3) }
         : null,
+    prefillGroups: Array.isArray(prefillGroups)
+      ? prefillGroups
+          .map((entry) => ({
+            attr: entry?.attr ?? null,
+            value: entry?.value ?? null,
+            count: Math.max(0, toNumber(entry?.count) ?? 0),
+          }))
+          .filter((entry) => entry.attr && entry.value != null && entry.count > 0)
+      : null,
+    prefillPlayerIds: Array.isArray(prefillPlayerIds)
+      ? prefillPlayerIds
+          .map((value) => (value == null ? null : String(value)))
+          .filter(Boolean)
+      : null,
     poolFilter: typeof poolFilter === "function" ? poolFilter : null,
   };
 };
@@ -6779,7 +6795,18 @@ const generateBaselineSeeds = (signature, players, squadSize, context, rules = n
       }
     }
   }
-  return dedupeSeeds([baselineSeed, ...requiredSeeds, ...exploratorySeeds]).slice(
+  const highChemSpreadSeed = createHighChemSpreadClusterSeed({
+    signature,
+    players,
+    squadSize,
+    context,
+  });
+  return dedupeSeeds([
+    baselineSeed,
+    highChemSpreadSeed,
+    ...requiredSeeds,
+    ...exploratorySeeds,
+  ]).slice(
     0,
     chemistryExplorationWanted || ratingExplorationWanted
       ? broadenLeagueExploration || broadenNationExploration
@@ -6958,6 +6985,391 @@ const getTopClusterClubIds = (players, attr, value, limit = 2) => {
     .map((entry) => entry.clubId);
 };
 
+const getTopGroupIdsForAttr = (
+  players,
+  attr,
+  signature,
+  squadSize,
+  limit = 8,
+  preferredIds = [],
+) => {
+  const axis =
+    Object.entries(AXIS_TO_ATTR).find(([, axisAttr]) => axisAttr === attr)?.[0] ??
+    null;
+  const groups = new Map();
+  for (const player of players || []) {
+    const value = player?.[attr];
+    if (value == null) continue;
+    if (!groups.has(value)) groups.set(value, []);
+    groups.get(value).push(player);
+  }
+  const preferred = new Set(
+    (preferredIds || [])
+      .map((value) => toNumber(value))
+      .filter((value) => value != null)
+      .map((value) => String(value)),
+  );
+  return Array.from(groups.entries())
+    .map(([value, list]) => {
+      const positions = new Set();
+      for (const player of list) {
+        const names = Array.isArray(player?.alternativePositionNames)
+          ? player.alternativePositionNames
+          : player?.preferredPositionName
+            ? [player.preferredPositionName]
+            : [];
+        for (const name of names) {
+          if (name != null) positions.add(String(name));
+        }
+      }
+      const avgRating = computeAverage(list.map((player) => player?.rating));
+      const fitScore = axis
+        ? scoreGroupCompositionFit(list, axis, signature, squadSize)
+        : 0;
+      const valueKey = String(toNumber(value) ?? value);
+      return {
+        value,
+        score:
+          list.length * 12 +
+          positions.size * 16 +
+          fitScore +
+          (preferred.has(valueKey) ? 400 : 0) -
+          avgRating,
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, toNumber(limit) ?? 8))
+    .map((entry) => entry.value);
+};
+
+const createLeagueSpreadTemplateSeeds = ({
+  signature,
+  failures,
+  players,
+  squadSize,
+}) => {
+  const minLeagues = toNumber(signature?.leagueCountMin) ?? 0;
+  const chemistryTarget = toNumber(signature?.totalChemistryTarget) ?? 0;
+  if (!signature?.isCompositionPuzzle) return [];
+  if (minLeagues < 4 || chemistryTarget < 28) return [];
+
+  const preferredLeagueIds = (failures || [])
+    .map((failure) => toNumber(failure?.dominantLeague))
+    .filter((value) => value != null);
+  const candidateLeagueIds = getTopGroupIdsForAttr(
+    players,
+    "leagueId",
+    signature,
+    squadSize,
+    10,
+    preferredLeagueIds,
+  );
+  if (candidateLeagueIds.length < minLeagues) return [];
+
+  const templates =
+    squadSize >= 11
+      ? [
+          [5, 3, 2, 1],
+          [6, 2, 2, 1],
+          [4, 3, 2, 2],
+        ]
+      : [
+          [Math.max(1, squadSize - minLeagues + 1)].concat(
+            new Array(Math.max(0, minLeagues - 1)).fill(1),
+          ),
+        ];
+  const seeds = [];
+  for (const template of templates) {
+    if (template.length < minLeagues) continue;
+    const leagueIds = candidateLeagueIds.slice(0, template.length);
+    if (leagueIds.length < template.length) continue;
+    const key = `league_spread:${template.join(".")}:${leagueIds
+      .map((value) => toNumber(value) ?? value)
+      .join(".")}`;
+    const quotas = leagueIds.map((value, leagueIndex) => ({
+      attr: "leagueId",
+      value,
+      count: template[leagueIndex],
+    }));
+    const quotaByLeague = new Map(
+      quotas.map((entry) => [
+        String(toNumber(entry.value) ?? entry.value),
+        entry.count,
+      ]),
+    );
+    seeds.push(
+      createSeedDescriptor({
+        key,
+        type: "league_spread_template",
+        label: `League spread ${template.join("/")}`,
+        tier: 2,
+        prefillGroups: quotas,
+        poolBias: (player) => {
+          const leagueKey = String(toNumber(player?.leagueId) ?? player?.leagueId);
+          const quota = quotaByLeague.get(leagueKey) ?? 0;
+          if (quota <= 0) return 0;
+          return -240 - quota * 90;
+        },
+      }),
+    );
+    if (seeds.length >= 3) break;
+  }
+  return seeds;
+};
+
+const createHighChemSpreadClusterSeed = ({
+  signature,
+  players,
+  squadSize,
+  context,
+}) => {
+  const minLeagues = toNumber(signature?.leagueCountMin) ?? 0;
+  const minClubs = toNumber(signature?.clubCountMin) ?? 0;
+  const sameNationMax = toNumber(signature?.sameNationMax);
+  const chemistryTarget = toNumber(signature?.totalChemistryTarget) ?? 0;
+  if (!signature?.isCompositionPuzzle) return null;
+  if (squadSize !== 11) return null;
+  if (chemistryTarget < 31 || minLeagues < 4 || minClubs < 5) return null;
+  if (sameNationMax != null && sameNationMax > 4) return null;
+
+  const slotList = normalizeSlotsForChemistry(context?.squadSlots || [], squadSize);
+  if (slotList.length < squadSize) return null;
+  const slotPositions = new Set(
+    slotList
+      .map((slot) => slot?.positionName ?? slot?.position ?? null)
+      .filter(Boolean)
+      .map(String),
+  );
+  const playablePositions = (player) => {
+    const alt = Array.isArray(player?.alternativePositionNames)
+      ? player.alternativePositionNames
+      : [];
+    if (alt.length) return alt.map(String);
+    return player?.preferredPositionName == null
+      ? []
+      : [String(player.preferredPositionName)];
+  };
+  const isGoldPlayer = (player) => getPlayerQuality(player?.rating) === "gold";
+  const uniqueDefinitionPlayers = (list) => {
+    const sorted = (list || [])
+      .filter((player) => player?.id != null)
+      .slice()
+      .sort((a, b) => {
+        const goldDiff = (isGoldPlayer(b) ? 1 : 0) - (isGoldPlayer(a) ? 1 : 0);
+        if (goldDiff !== 0) return goldDiff;
+        return (toNumber(a?.rating) ?? 0) - (toNumber(b?.rating) ?? 0);
+      });
+    const seen = new Set();
+    const out = [];
+    for (const player of sorted) {
+      const key = String(getDefinitionKey(player) ?? player.id);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(player);
+    }
+    return out;
+  };
+  const chooseCombos = (list, size, limit) => {
+    const out = [];
+    const source = list.slice(0, Math.max(size, 20));
+    const walk = (start, acc) => {
+      if (out.length >= limit) return;
+      if (acc.length === size) {
+        out.push(acc.slice());
+        return;
+      }
+      for (let i = start; i <= source.length - (size - acc.length); i += 1) {
+        acc.push(source[i]);
+        walk(i + 1, acc);
+        acc.pop();
+      }
+    };
+    walk(0, []);
+    return out;
+  };
+  const groupScore = (list) => {
+    const positions = new Set();
+    for (const player of list || []) {
+      for (const position of playablePositions(player)) {
+        if (slotPositions.has(position)) positions.add(position);
+      }
+    }
+    const nations = buildCountsMap(list || [], "nationId");
+    const nationScore = Array.from(nations.values()).reduce(
+      (sum, count) => sum + count * count,
+      0,
+    );
+    return (
+      positions.size * 600 +
+      (list || []).filter(isGoldPlayer).length * 1800 +
+      nationScore * 180 -
+      (list || []).reduce((sum, player) => sum + (toNumber(player?.rating) ?? 0), 0)
+    );
+  };
+  const byClub = new Map();
+  for (const player of players || []) {
+    if (!player || player.leagueId == null || player.teamId == null) continue;
+    if (getPlayerQuality(player?.rating) === "bronze") continue;
+    const key = `${player.leagueId}|${player.teamId}`;
+    if (!byClub.has(key)) byClub.set(key, []);
+    byClub.get(key).push(player);
+  }
+
+  const pairsByLeague = new Map();
+  const singlesByLeague = new Map();
+  const trios = [];
+  for (const [key, rawList] of byClub.entries()) {
+    const [leagueId, teamId] = key.split("|");
+    const list = uniqueDefinitionPlayers(rawList);
+    for (const player of list) {
+      if (!singlesByLeague.has(leagueId)) singlesByLeague.set(leagueId, []);
+      singlesByLeague.get(leagueId).push({
+        leagueId,
+        teamId,
+        players: [player],
+        score: groupScore([player]),
+      });
+    }
+    if (list.length >= 2) {
+      const pairs = chooseCombos(list, 2, 80)
+        .map((combo) => ({
+          leagueId,
+          teamId,
+          players: combo,
+          score: groupScore(combo),
+        }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 10);
+      if (!pairsByLeague.has(leagueId)) pairsByLeague.set(leagueId, []);
+      pairsByLeague.get(leagueId).push(...pairs);
+    }
+    if (list.length >= 3) {
+      trios.push(
+        ...chooseCombos(list, 3, 160)
+          .map((combo) => ({
+            leagueId,
+            teamId,
+            players: combo,
+            score: groupScore(combo),
+          }))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 12),
+      );
+    }
+  }
+  for (const list of pairsByLeague.values()) list.sort((a, b) => b.score - a.score);
+  for (const list of singlesByLeague.values()) list.sort((a, b) => b.score - a.score);
+  trios.sort((a, b) => b.score - a.score);
+
+  const league4Groups = [];
+  for (const [leagueId, pairs] of pairsByLeague.entries()) {
+    const limited = pairs.slice(0, 80);
+    for (let i = 0; i < limited.length; i += 1) {
+      for (let j = i + 1; j < limited.length; j += 1) {
+        if (limited[i].teamId === limited[j].teamId) continue;
+        const groupPlayers = limited[i].players.concat(limited[j].players);
+        const defs = new Set(
+          groupPlayers.map((player) => String(getDefinitionKey(player) ?? player.id)),
+        );
+        if (defs.size !== groupPlayers.length) continue;
+        league4Groups.push({
+          leagueId,
+          teamIds: [limited[i].teamId, limited[j].teamId],
+          players: groupPlayers,
+          score: limited[i].score + limited[j].score,
+        });
+      }
+    }
+  }
+  league4Groups.sort((a, b) => b.score - a.score);
+
+  const validTemplate = (squad) => {
+    if (!Array.isArray(squad) || squad.length !== 11) return false;
+    if (new Set(squad.map((player) => String(player.id))).size !== 11) return false;
+    if (
+      new Set(squad.map((player) => String(getDefinitionKey(player) ?? player.id))).size !==
+      11
+    ) {
+      return false;
+    }
+    if (buildCountsMap(squad, "leagueId").size < minLeagues) return false;
+    if (buildCountsMap(squad, "teamId").size < minClubs) return false;
+    if (squad.filter(isGoldPlayer).length < 9) return false;
+    const nationCounts = buildCountsMap(squad, "nationId");
+    for (const count of nationCounts.values()) {
+      if (sameNationMax != null && count > sameNationMax) return false;
+      if (count < 2) return false;
+    }
+    return true;
+  };
+
+  let best = null;
+  const remember = (groups) => {
+    const squad = groups.flatMap((group) => group.players);
+    if (!validTemplate(squad)) return false;
+    const chem = computeChemistryEval(squad, slotList, squadSize);
+    const score =
+      (toNumber(chem?.totalChem) ?? 0) * 1000000 +
+      (toNumber(chem?.minChem) ?? 0) * 10000 -
+      squad.reduce((sum, player) => sum + (toNumber(player?.rating) ?? 0), 0);
+    if (!best || score > best.score) {
+      best = { groups, squad, chem, score };
+    }
+    return (toNumber(chem?.totalChem) ?? 0) >= chemistryTarget;
+  };
+
+  const topLeague4 = league4Groups.slice(0, 220);
+  const topTrios = trios.slice(0, 500);
+  for (const league4 of topLeague4) {
+    for (let i = 0; i < topTrios.length; i += 1) {
+      const trioA = topTrios[i];
+      if (trioA.leagueId === league4.leagueId) continue;
+      for (let j = i + 1; j < topTrios.length; j += 1) {
+        const trioB = topTrios[j];
+        if (
+          trioB.leagueId === league4.leagueId ||
+          trioB.leagueId === trioA.leagueId
+        ) {
+          continue;
+        }
+        const partial = [league4, trioA, trioB];
+        const partialSquad = partial.flatMap((group) => group.players);
+        if (
+          new Set(
+            partialSquad.map((player) => String(getDefinitionKey(player) ?? player.id)),
+          ).size !== partialSquad.length
+        ) {
+          continue;
+        }
+        if (partialSquad.filter(isGoldPlayer).length < 8) continue;
+        const partialNationCounts = buildCountsMap(partialSquad, "nationId");
+        const maxPartialNation = Math.max(0, ...partialNationCounts.values());
+        if (sameNationMax != null && maxPartialNation > sameNationMax) continue;
+        const usedLeagues = new Set([league4.leagueId, trioA.leagueId, trioB.leagueId]);
+        for (const [singleLeague, singles] of singlesByLeague.entries()) {
+          if (usedLeagues.has(singleLeague)) continue;
+          for (const single of singles.slice(0, 30)) {
+            if (remember(partial.concat(single))) {
+              const playerIds = best.squad.map((player) => String(player.id));
+              const key = `spread_4331:${playerIds.join(".")}`;
+              const preferred = new Set(playerIds);
+              return createSeedDescriptor({
+                key,
+                type: "spread_4331_cluster",
+                label: "Spread 4/3/3/1 cluster",
+                tier: 2,
+                prefillPlayerIds: playerIds,
+                poolBias: (player) => (preferred.has(String(player?.id)) ? -1200 : 0),
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+  return null;
+};
+
 const createHybridClusterSeed = ({
   failures,
   players,
@@ -7044,6 +7456,15 @@ const generateRescueSeeds = (
     list.push(seed);
   };
   const usefulFailures = sortedFailures.slice(0, 4);
+  pushSeed(
+    tier1,
+    createHighChemSpreadClusterSeed({
+      signature,
+      players,
+      squadSize,
+      context,
+    }),
+  );
   for (const failure of usefulFailures) {
     if (
       failure.dominantLeague != null &&
@@ -7128,6 +7549,14 @@ const generateRescueSeeds = (
       }
       if (hybridIndex >= 4) break;
     }
+  }
+  for (const seed of createLeagueSpreadTemplateSeeds({
+    signature,
+    failures: usefulFailures,
+    players,
+    squadSize,
+  })) {
+    pushSeed(tier1, seed);
   }
   for (const groupId of signature?.requiredLeagueIds || []) {
     pushSeed(
@@ -7716,6 +8145,82 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
     hardFilteredRules.add(rule);
   }
 
+  if (Array.isArray(contextSeed?.prefillPlayerIds)) {
+    const prefillIds = new Set(contextSeed.prefillPlayerIds.map(String));
+    const selected = pool
+      .filter((player) => player?.id != null && prefillIds.has(String(player.id)))
+      .sort((a, b) => {
+        const aIndex = contextSeed.prefillPlayerIds.indexOf(String(a.id));
+        const bIndex = contextSeed.prefillPlayerIds.indexOf(String(b.id));
+        return aIndex - bIndex;
+      });
+    let filled = 0;
+    for (const player of selected) {
+      if (squad.length >= squadSize) break;
+      if (!player || player.id == null || lockedIds.has(player.id)) continue;
+      squad.push(player);
+      lockedIds.add(player.id);
+      filled += 1;
+    }
+    appliedFilters.push({
+      type: "seed_prefill_players",
+      method: "prefill",
+      required: Math.min(contextSeed.prefillPlayerIds.length, squadSize),
+      filled,
+    });
+    debugPush?.({
+      stage: "seed",
+      action: "prefill_players",
+      requested: contextSeed.prefillPlayerIds.length,
+      filled,
+      squadSize: squad.length,
+    });
+  }
+
+  if (Array.isArray(contextSeed?.prefillGroups)) {
+    for (const group of contextSeed.prefillGroups) {
+      const attr = group?.attr ?? null;
+      const value = group?.value ?? null;
+      const required = Math.min(squadSize, toNumber(group?.count) ?? 0);
+      if (!attr || value == null || required <= 0) continue;
+      const groupPredicate = (player) =>
+        String(player?.[attr] ?? "") === String(value);
+      const filled = prefillPlayers(
+        squad,
+        pool,
+        groupPredicate,
+        required,
+        lockedIds,
+        {
+          uniqueMaxByAttr,
+          sameMaxByAttr,
+          predicateCaps,
+          squadSizeCap: squadSize,
+          ratingHint: ratingFillHint,
+          preferencePredicates: prefillPreferencePredicates,
+          seed: contextSeed,
+        },
+      );
+      appliedFilters.push({
+        type: "seed_prefill_group",
+        method: "prefill",
+        attr,
+        value,
+        required,
+        filled,
+      });
+      debugPush?.({
+        stage: "seed",
+        action: "prefill_group",
+        attr,
+        value,
+        required,
+        filled,
+        squadSize: squad.length,
+      });
+    }
+  }
+
   for (const type of FILTER_PRIORITY) {
     const rulesForType = rulesByType.get(type) || [];
     for (const rule of rulesForType) {
@@ -7994,6 +8499,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       predicateCaps,
       ratingHint: ratingFillHint,
       preferencePredicates: fillPreferencePredicates,
+      seed: contextSeed,
     });
     rebuildLockedIdsFromSquad(squad, lockedIds);
     debugPush?.({
