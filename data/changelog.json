@@ -2,6 +2,16 @@
   "version": 1,
   "releases": [
     {
+      "version": "1.9.3",
+      "date": "2026-05-08",
+      "headline": "Improved sequence solver panel and solving algorithm.",
+      "summary": "Added a review before submit mode as an option in the sequence solver.",
+      "details": [
+        "Added a review before submit mode as an option in the sequence solver.",
+        "improved sequence solvers algorthim to deal with complex chem challenges."
+      ]
+    },
+    {
       "version": "1.9.2",
       "date": "2026-04-25",
       "headline": "Improved fetching speeds.",
