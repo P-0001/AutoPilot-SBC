@@ -6290,6 +6290,124 @@ const buildChallengeSignature = (rules, squadSize) => {
   return signature;
 };
 
+const classifyHighChemShape = (signature, rules, squadSize, context = {}) => {
+  const size = Math.max(1, toNumber(squadSize) ?? DEFAULT_SQUAD_SIZE);
+  const totalChemistryTarget = toNumber(signature?.totalChemistryTarget);
+  const minPlayerChemistryTarget = toNumber(
+    signature?.minPlayerChemistryTarget,
+  );
+  const hasChemistry =
+    totalChemistryTarget != null || minPlayerChemistryTarget != null;
+  const leagueMin = toNumber(signature?.leagueCountMin) ?? 0;
+  const nationMin = toNumber(signature?.nationCountMin) ?? 0;
+  const clubMin = toNumber(signature?.clubCountMin) ?? 0;
+  const sameLeagueMax = toNumber(signature?.sameLeagueMax);
+  const sameNationMax = toNumber(signature?.sameNationMax);
+  const sameClubMax = toNumber(signature?.sameClubMax);
+  const targetRatio =
+    totalChemistryTarget == null ? 0 : totalChemistryTarget / Math.max(1, size);
+  const slotCount = Array.isArray(context?.squadSlots)
+    ? context.squadSlots.length
+    : 0;
+  const list = Array.isArray(rules) ? rules : [];
+  const hasGoldQuota = list.some((rule) => {
+    if (!rule) return false;
+    if (rule.type !== "player_quality" && rule.type !== "player_level")
+      return false;
+    const required = getRuleCount(rule, size);
+    if (required == null || required <= 0) return false;
+    const values = (rule.values || []).map((value) =>
+      normalizeString(String(value)),
+    );
+    return values.some((value) => value.includes("gold"));
+  });
+  const hasSpecialPressure = Boolean(
+    signature?.hasInformRequirement ||
+      list.some(
+        (rule) =>
+          rule?.type === "player_totw_or_tots" ||
+          rule?.type === "player_tots" ||
+          rule?.type === "player_inform",
+      ),
+  );
+
+  const shape = {
+    enabled: Boolean(hasChemistry && signature?.isCompositionPuzzle),
+    isHighChem: Boolean(
+      totalChemistryTarget != null &&
+        totalChemistryTarget >= Math.max(22, Math.floor(size * 2)),
+    ),
+    isVeryHighChem: Boolean(
+      totalChemistryTarget != null &&
+        totalChemistryTarget >= Math.max(31, Math.floor(size * 2.75)),
+    ),
+    totalChemistryTarget: totalChemistryTarget ?? null,
+    minPlayerChemistryTarget: minPlayerChemistryTarget ?? null,
+    targetRatio,
+    squadSize: size,
+    leagueMin,
+    nationMin,
+    clubMin,
+    sameLeagueMax: sameLeagueMax ?? null,
+    sameNationMax: sameNationMax ?? null,
+    sameClubMax: sameClubMax ?? null,
+    hasLeagueSpread: Boolean(
+      leagueMin >= 3 || signature?.leagueCountMax != null || sameLeagueMax != null,
+    ),
+    hasNationSpread: Boolean(
+      nationMin >= 3 || signature?.nationCountMax != null || sameNationMax != null,
+    ),
+    hasClubSpread: Boolean(
+      clubMin >= 4 || signature?.clubCountMax != null || sameClubMax != null,
+    ),
+    hasSpreadPressure: false,
+    hasCapPressure: Boolean(
+      sameLeagueMax != null || sameNationMax != null || sameClubMax != null,
+    ),
+    hasRatingPressure: toNumber(signature?.ratingTarget) != null,
+    hasGoldQuota,
+    hasRareRequirement: Boolean(signature?.hasRareRequirement),
+    hasSpecialPressure,
+    hasStrictPositions: slotCount >= size,
+  };
+  shape.hasSpreadPressure = Boolean(
+    shape.hasLeagueSpread || shape.hasNationSpread || shape.hasClubSpread,
+  );
+  shape.route =
+    shape.isVeryHighChem && shape.hasLeagueSpread && shape.hasClubSpread
+      ? "spread_cluster"
+      : shape.isHighChem && shape.hasLeagueSpread
+        ? "cross_league"
+        : shape.isHighChem
+          ? "club_core"
+          : "default";
+  return shape;
+};
+
+const summarizeHighChemShape = (shape) =>
+  shape?.enabled
+    ? {
+        route: shape.route,
+        targetChem: shape.totalChemistryTarget,
+        minPlayerChem: shape.minPlayerChemistryTarget,
+        leagueMin: shape.leagueMin,
+        nationMin: shape.nationMin,
+        clubMin: shape.clubMin,
+        sameLeagueMax: shape.sameLeagueMax,
+        sameNationMax: shape.sameNationMax,
+        sameClubMax: shape.sameClubMax,
+        high: shape.isHighChem,
+        veryHigh: shape.isVeryHighChem,
+        spread: shape.hasSpreadPressure,
+        caps: shape.hasCapPressure,
+        rating: shape.hasRatingPressure,
+        gold: shape.hasGoldQuota,
+        rare: shape.hasRareRequirement,
+        special: shape.hasSpecialPressure,
+        strictPositions: shape.hasStrictPositions,
+      }
+    : null;
+
 const getBaselinePhaseConfig = (baseConfig = {}) => {
   const base = baseConfig && typeof baseConfig === "object" ? baseConfig : {};
   return {
@@ -6313,6 +6431,11 @@ const getPhaseConfig = (signature, baseConfig = {}) => {
       },
     };
   }
+  const highChemLeagueNationSpread = Boolean(
+    (toNumber(signature?.totalChemistryTarget) ?? 0) >= 31 &&
+      (toNumber(signature?.leagueCountMin) ?? 0) >= 5 &&
+      (toNumber(signature?.nationCountMin) ?? 0) >= 5,
+  );
   return {
     id: "composition",
     optimize: {
@@ -6331,7 +6454,27 @@ const getPhaseConfig = (signature, baseConfig = {}) => {
       chemTimeBudgetMs: Math.max(toNumber(base.chemTimeBudgetMs) ?? 0, 1500),
       chemExtendedShortfallThreshold: Math.max(
         toNumber(base.chemExtendedShortfallThreshold) ?? 2,
-        4,
+        highChemLeagueNationSpread ? 5 : 4,
+      ),
+      chemNearTargetShortfall: Math.max(
+        toNumber(base.chemNearTargetShortfall) ?? 2,
+        highChemLeagueNationSpread ? 4 : 2,
+      ),
+      chemExtendedTimeBudgetMs: Math.max(
+        toNumber(base.chemExtendedTimeBudgetMs) ?? 0,
+        highChemLeagueNationSpread ? 8000 : 0,
+      ),
+      chemExtendedEscapeDepth: Math.max(
+        toNumber(base.chemExtendedEscapeDepth) ?? 0,
+        highChemLeagueNationSpread ? 6 : 0,
+      ),
+      chemExtendedEscapeBeamWidth: Math.max(
+        toNumber(base.chemExtendedEscapeBeamWidth) ?? 0,
+        highChemLeagueNationSpread ? 32 : 0,
+      ),
+      chemExtendedEscapeCandidateLimit: Math.max(
+        toNumber(base.chemExtendedEscapeCandidateLimit) ?? 0,
+        highChemLeagueNationSpread ? 180 : 0,
       ),
       refineSolvedSquad: false,
       refineBalancedReshape: false,
@@ -6356,6 +6499,9 @@ const createSeedDescriptor = ({
   groupId = null,
   label = "Baseline",
   strength = 3,
+  family = null,
+  reason = null,
+  budgetMs = null,
   poolFilter = null,
   poolBias = null,
   prefillBias = null,
@@ -6373,6 +6519,9 @@ const createSeedDescriptor = ({
     groupId,
     label,
     tier,
+    family,
+    reason,
+    budgetMs: toNumber(budgetMs) ?? null,
     poolBias:
       typeof poolBias === "function"
         ? poolBias
@@ -6524,6 +6673,12 @@ const generateBaselineSeeds = (signature, players, squadSize, context, rules = n
     type: "baseline",
     label: "Baseline",
   });
+  const highChemShape = classifyHighChemShape(
+    signature,
+    rules,
+    squadSize,
+    context,
+  );
   const broadenLeagueExploration = shouldBroadenSeedExploration(
     signature,
     "league",
@@ -6795,18 +6950,32 @@ const generateBaselineSeeds = (signature, players, squadSize, context, rules = n
       }
     }
   }
-  const highChemSpreadSeed = createHighChemSpreadClusterSeed({
+  const highChemSeeds = buildHighChemSeedPlan({
+    shape: highChemShape,
     signature,
     players,
     squadSize,
     context,
+    rules,
+    phase: "baseline",
   });
-  return dedupeSeeds([
-    baselineSeed,
-    highChemSpreadSeed,
-    ...requiredSeeds,
-    ...exploratorySeeds,
-  ]).slice(
+  const highChemFirst = Boolean(
+    highChemShape?.isVeryHighChem && (toNumber(highChemShape?.clubMin) ?? 0) >= 5,
+  );
+  const orderedSeeds = highChemFirst
+    ? [
+        baselineSeed,
+        ...highChemSeeds,
+        ...requiredSeeds,
+        ...exploratorySeeds,
+      ]
+    : [
+        baselineSeed,
+        ...requiredSeeds,
+        ...exploratorySeeds,
+        ...highChemSeeds,
+      ];
+  return dedupeSeeds(orderedSeeds).slice(
     0,
     chemistryExplorationWanted || ratingExplorationWanted
       ? broadenLeagueExploration || broadenNationExploration
@@ -7066,30 +7235,38 @@ const createLeagueSpreadTemplateSeeds = ({
   );
   if (candidateLeagueIds.length < minLeagues) return [];
 
-  const templates =
+  const leagueCountDistributions =
     squadSize >= 11
-      ? [
-          [5, 3, 2, 1],
-          [6, 2, 2, 1],
-          [4, 3, 2, 2],
-        ]
+      ? minLeagues >= 5
+        ? [
+            [5, 3, 1, 1, 1],
+            [5, 2, 2, 1, 1],
+            [3, 2, 2, 2, 2],
+            [4, 2, 2, 2, 1],
+            [3, 3, 2, 2, 1],
+          ]
+        : [
+            [5, 3, 2, 1],
+            [6, 2, 2, 1],
+            [4, 3, 2, 2],
+          ]
       : [
           [Math.max(1, squadSize - minLeagues + 1)].concat(
             new Array(Math.max(0, minLeagues - 1)).fill(1),
           ),
         ];
   const seeds = [];
-  for (const template of templates) {
-    if (template.length < minLeagues) continue;
-    const leagueIds = candidateLeagueIds.slice(0, template.length);
-    if (leagueIds.length < template.length) continue;
-    const key = `league_spread:${template.join(".")}:${leagueIds
+  for (const distribution of leagueCountDistributions) {
+    if (distribution.length < minLeagues) continue;
+    const leagueIds = candidateLeagueIds.slice(0, distribution.length);
+    if (leagueIds.length < distribution.length) continue;
+    const key = `league_spread_counts:${distribution.join(".")}:${leagueIds
       .map((value) => toNumber(value) ?? value)
       .join(".")}`;
     const quotas = leagueIds.map((value, leagueIndex) => ({
       attr: "leagueId",
       value,
-      count: template[leagueIndex],
+      count: distribution[leagueIndex],
     }));
     const quotaByLeague = new Map(
       quotas.map((entry) => [
@@ -7101,7 +7278,9 @@ const createLeagueSpreadTemplateSeeds = ({
       createSeedDescriptor({
         key,
         type: "league_spread_template",
-        label: `League spread ${template.join("/")}`,
+        label: `League count distribution ${distribution.join("-")}`,
+        family: "league_spread_template",
+        reason: "league_spread_pressure",
         tier: 2,
         prefillGroups: quotas,
         poolBias: (player) => {
@@ -7351,12 +7530,14 @@ const createHighChemSpreadClusterSeed = ({
           for (const single of singles.slice(0, 30)) {
             if (remember(partial.concat(single))) {
               const playerIds = best.squad.map((player) => String(player.id));
-              const key = `spread_4331:${playerIds.join(".")}`;
+              const key = `spread_topology_4_3_3_1:${playerIds.join(".")}`;
               const preferred = new Set(playerIds);
               return createSeedDescriptor({
                 key,
-                type: "spread_4331_cluster",
-                label: "Spread 4/3/3/1 cluster",
+                type: "spread_topology_4_3_3_1",
+                label: "Spread count 4/3/3/1 topology",
+                family: "spread_cluster",
+                reason: "very_high_chem_league_club_spread",
                 tier: 2,
                 prefillPlayerIds: playerIds,
                 poolBias: (player) => (preferred.has(String(player?.id)) ? -1200 : 0),
@@ -7368,6 +7549,221 @@ const createHighChemSpreadClusterSeed = ({
     }
   }
   return null;
+};
+
+const createHighChemClubCoreSeeds = ({
+  shape,
+  signature,
+  players,
+  squadSize,
+  rules,
+}) => {
+  if (!shape?.enabled || !shape?.isHighChem) return [];
+  if (shape.hasSpreadPressure && shape.route !== "club_core") return [];
+  const seeds = [];
+  const leagueIds = getTopGroupIdsForAttr(
+    players,
+    "leagueId",
+    signature,
+    squadSize,
+    2,
+    [],
+  );
+  for (const leagueId of leagueIds) {
+    const clubIds = getTopClusterClubIds(players, "leagueId", leagueId, 3);
+    if (!clubIds.length) continue;
+    const clubSet = new Set(clubIds.map((id) => String(toNumber(id) ?? id)));
+    const leagueKey = String(toNumber(leagueId) ?? leagueId);
+    seeds.push(
+      createSeedDescriptor({
+        key: `club_core:l=${leagueKey}:c=${Array.from(clubSet).join(".")}`,
+        type: "club_core",
+        axis: "league",
+        groupId: leagueId,
+        label: `Club core league ${leagueId}`,
+        family: "same_league_club_core",
+        reason: "high_chem_low_spread_pressure",
+        strength: 5,
+        tier: 1,
+        poolBias: (player) => {
+          if (!player) return 0;
+          let score = 0;
+          if (String(player?.leagueId ?? "") === String(leagueId)) score -= 320;
+          if (clubSet.has(String(toNumber(player?.teamId) ?? player?.teamId))) {
+            score -= 720;
+          }
+          return score;
+        },
+        prefillGroups:
+          clubIds.length >= 2
+            ? clubIds.slice(0, 2).map((clubId) => ({
+                attr: "teamId",
+                value: clubId,
+                count: 2,
+              }))
+            : null,
+      }),
+    );
+  }
+  return dedupeSeeds(seeds).slice(0, rules ? 2 : 1);
+};
+
+const createHighChemCrossLeagueNationSeeds = ({
+  shape,
+  signature,
+  players,
+  squadSize,
+}) => {
+  if (!shape?.enabled || !shape?.isHighChem) return [];
+  if (!shape.hasLeagueSpread && shape.route !== "cross_league") return [];
+  if ((toNumber(shape?.nationMin) ?? 0) >= 5) return [];
+  const nationIds = getTopGroupIdsForAttr(
+    players,
+    "nationId",
+    signature,
+    squadSize,
+    3,
+    [],
+  );
+  const seeds = [];
+  for (const nationId of nationIds) {
+    const nationKey = String(toNumber(nationId) ?? nationId);
+    const clubCluster = getTopClusterClubIds(players, "nationId", nationId, 3)
+      .map((id) => String(toNumber(id) ?? id));
+    seeds.push(
+      createSeedDescriptor({
+        key: `cross_league_nation:n=${nationKey}`,
+        type: "cross_league_nation",
+        axis: "nation",
+        groupId: nationId,
+        label: `Cross-league nation ${nationId}`,
+        family: "same_nation_cross_league",
+        reason: "high_chem_league_spread_pressure",
+        strength: 5,
+        tier: 1,
+        poolBias: (player) => {
+          if (!player) return 0;
+          let score = 0;
+          if (String(player?.nationId ?? "") === String(nationId)) score -= 620;
+          if (clubCluster.includes(String(toNumber(player?.teamId) ?? player?.teamId))) {
+            score -= 260;
+          }
+          return score;
+        },
+        prefillGroups: [
+          {
+            attr: "nationId",
+            value: nationId,
+            count: Math.min(
+              squadSize,
+              Math.max(3, Math.min(6, Math.ceil((squadSize || 11) / 2))),
+            ),
+          },
+        ],
+      }),
+    );
+  }
+  return dedupeSeeds(seeds).slice(0, 2);
+};
+
+const buildHighChemSeedPlan = ({
+  shape,
+  signature,
+  failures = [],
+  players,
+  squadSize,
+  context,
+  rules,
+  phase = "baseline",
+}) => {
+  if (!shape?.enabled || !shape?.isHighChem) return [];
+  const seeds = [];
+  const push = (seed) => {
+    if (!seed) return;
+    seeds.push(seed);
+  };
+
+  if (shape.route === "spread_cluster") {
+    push(
+      createHighChemSpreadClusterSeed({
+        signature,
+        players,
+        squadSize,
+        context,
+      }),
+    );
+  }
+
+  if (shape.route === "club_core") {
+    for (const seed of createHighChemClubCoreSeeds({
+      shape,
+      signature,
+      players,
+      squadSize,
+      rules,
+    })) {
+      push(seed);
+    }
+  }
+
+  if (shape.route === "cross_league" || shape.hasLeagueSpread) {
+    for (const seed of createHighChemCrossLeagueNationSeeds({
+      shape,
+      signature,
+      players,
+      squadSize,
+    })) {
+      push(seed);
+    }
+  }
+
+  if (shape.hasLeagueSpread) {
+    for (const seed of createLeagueSpreadTemplateSeeds({
+      signature,
+      failures,
+      players,
+      squadSize,
+    })) {
+      push(seed);
+    }
+  }
+
+  return dedupeSeeds(seeds).slice(0, phase === "rescue" ? 6 : 4);
+};
+
+const getHighChemRescueReason = (shape, failures = []) => {
+  if (!shape?.enabled) return null;
+  const best = (failures || []).slice().sort(compareFailureSummaries)[0] ?? null;
+  if (!best) return "no_failure_memory";
+  const failingTypes = Array.isArray(best?.failingTypes)
+    ? best.failingTypes
+    : [];
+  const onlyChemistry =
+    failingTypes.length > 0 &&
+    failingTypes.every(
+      (type) =>
+        type === "chemistry_points" ||
+        type === "all_players_chemistry_points",
+    );
+  if (onlyChemistry && (toNumber(best?.chemShortfall) ?? Infinity) <= 2) {
+    return "chem_shortfall_near_target";
+  }
+  if (
+    failingTypes.includes("league_count") ||
+    failingTypes.includes("club_count") ||
+    failingTypes.includes("nation_count")
+  ) {
+    return "spread_requirement_failed";
+  }
+  if (
+    failingTypes.includes("same_league_count") ||
+    failingTypes.includes("same_club_count") ||
+    failingTypes.includes("same_nation_count")
+  ) {
+    return "identity_cap_failed";
+  }
+  if (failingTypes.includes("team_rating")) return "rating_after_chem_failed";
+  return "generic_high_chem_rescue";
 };
 
 const createHybridClusterSeed = ({
@@ -7456,15 +7852,23 @@ const generateRescueSeeds = (
     list.push(seed);
   };
   const usefulFailures = sortedFailures.slice(0, 4);
-  pushSeed(
-    tier1,
-    createHighChemSpreadClusterSeed({
-      signature,
-      players,
-      squadSize,
-      context,
-    }),
+  const highChemShape = classifyHighChemShape(
+    signature,
+    [],
+    squadSize,
+    context,
   );
+  for (const seed of buildHighChemSeedPlan({
+    shape: highChemShape,
+    signature,
+    failures: usefulFailures,
+    players,
+    squadSize,
+    context,
+    phase: "rescue",
+  })) {
+    pushSeed(tier1, seed);
+  }
   for (const failure of usefulFailures) {
     if (
       failure.dominantLeague != null &&
@@ -9405,6 +9809,12 @@ export const solveSquad = (context) => {
     normalizedPlayers.length,
   );
   const signature = buildChallengeSignature(rules, squadSize);
+  const highChemShape = classifyHighChemShape(
+    signature,
+    rules,
+    squadSize,
+    baseContext,
+  );
   const baselinePhaseConfig = getBaselinePhaseConfig(
     baseContext?.optimize || {},
   );
@@ -9419,10 +9829,15 @@ export const solveSquad = (context) => {
     baselinePhaseConfig.optimize.chemClubSearch = false;
     fallbackPhaseConfig.optimize.chemClubSearch = false;
   }
+  const highChemLeagueNationSpread = Boolean(
+    (toNumber(signature?.totalChemistryTarget) ?? 0) >= 31 &&
+      (toNumber(signature?.leagueCountMin) ?? 0) >= 5 &&
+      (toNumber(signature?.nationCountMin) ?? 0) >= 5,
+  );
   const restartTimeBudgetMs = Math.max(
     1000,
     toNumber(baseContext?.optimize?.restartTimeBudgetMs) ??
-      DEFAULT_RESTART_TIME_BUDGET_MS,
+      (highChemLeagueNationSpread ? 30000 : DEFAULT_RESTART_TIME_BUDGET_MS),
   );
   const fallbackTimeBudgetMs = Math.max(
     0,
@@ -9443,6 +9858,12 @@ export const solveSquad = (context) => {
     rescueSeeds: [],
     winningSeed: null,
     perSeed: [],
+    highChem: {
+      shape: summarizeHighChemShape(highChemShape),
+      seedPlan: [],
+      rescueReason: null,
+      attempts: [],
+    },
   };
   const deadlineAt = Date.now() + restartTimeBudgetMs;
   let activeDeadlineAt = deadlineAt;
@@ -9484,15 +9905,32 @@ export const solveSquad = (context) => {
         axis: seed?.axis ?? null,
         groupId: seed?.groupId ?? null,
         tier: seed?.tier ?? 0,
+        family: seed?.family ?? null,
+        reason: seed?.reason ?? null,
       },
       solved: Boolean(result?.stats?.solved),
       failureSummary,
     });
+    if (highChemShape?.enabled && highChemShape?.isHighChem) {
+      orchestration.highChem.attempts.push({
+        seed: seed?.type ?? "baseline",
+        family: seed?.family ?? null,
+        reason: seed?.reason ?? null,
+        solved: Boolean(result?.stats?.solved),
+        chem: toNumber(result?.stats?.chemistry?.totalChem) ?? null,
+        minChem: toNumber(result?.stats?.chemistry?.minChem) ?? null,
+        chemShortfall: toNumber(failureSummary?.chemShortfall) ?? null,
+        failingTypes: failureSummary?.failingTypes ?? [],
+        rating: failureSummary?.rating ?? null,
+      });
+    }
     const seedSummary = {
       type: seed?.type ?? "baseline",
       axis: seed?.axis ?? null,
       groupId: seed?.groupId ?? null,
       tier: seed?.tier ?? 0,
+      family: seed?.family ?? null,
+      reason: seed?.reason ?? null,
     };
     if (!bestResult || compareSolverResults(result, bestResult) < 0) {
       bestResult = result;
@@ -9554,7 +9992,17 @@ export const solveSquad = (context) => {
     groupId: seed?.groupId ?? null,
     tier: seed?.tier ?? 0,
     label: seed?.label ?? null,
+    family: seed?.family ?? null,
+    reason: seed?.reason ?? null,
   }));
+  orchestration.highChem.seedPlan = orchestration.baselineSeeds
+    .filter((seed) => seed.family != null)
+    .map((seed) => ({
+      type: seed.type,
+      family: seed.family,
+      reason: seed.reason,
+      label: seed.label,
+    }));
 
   for (const seed of seeds) {
     if (Date.now() >= activeDeadlineAt) {
@@ -9590,6 +10038,10 @@ export const solveSquad = (context) => {
     baseContext,
     triedSeedKeys,
   );
+  orchestration.highChem.rescueReason = getHighChemRescueReason(
+    highChemShape,
+    failureMemory,
+  );
   orchestration.rescueSeeds = [
     ...(rescueSeeds?.tier1 || []),
     ...(rescueSeeds?.tier3 || []),
@@ -9599,6 +10051,8 @@ export const solveSquad = (context) => {
     groupId: seed?.groupId ?? null,
     tier: seed?.tier ?? 0,
     label: seed?.label ?? null,
+    family: seed?.family ?? null,
+    reason: seed?.reason ?? null,
   }));
 
   for (const tierSeed of rescueSeeds?.tier1 || []) {
