@@ -929,6 +929,7 @@
           : "Unknown";
       const rarity = player?.rarityName ?? "";
       const definitionId = player?.definitionId ?? null;
+      const priceLookupId = definitionId ?? playerId;
       rows.push({
         originalIndex: index,
         slotIndex,
@@ -939,9 +940,11 @@
         name,
         rarity,
         definitionId,
+        priceLookupId,
         isSpecial: Boolean(player?.isSpecial),
         chemVal: perChem?.[index],
         onPosVal: onPos?.[index],
+        priceMeta: readCachedPlayerPrice(priceLookupId),
       });
     }
 
@@ -982,6 +985,15 @@
             '<span class="ea-data-pill ea-data-pill--special">Special</span>',
           );
         }
+        statusPills.push(
+          `<span class="ea-data-pill ea-data-pill--price ${escapeHtml(
+            getPlayerPriceHeatClass(getEffectivePlayerPriceMeta(row)),
+          )}">${escapeHtml(
+            getPlayerPriceLabel(
+              getEffectivePlayerPriceMeta(row),
+            ),
+          )}</span>`,
+        );
         if (row?.onPosVal === false) {
           statusPills.push(
             '<span class="ea-data-pill ea-data-pill--warn">Off-pos</span>',
@@ -1029,6 +1041,383 @@
       .join("");
     return `<div class="ea-data-preview-players">${rowMarkup}</div>`;
   };
+
+  const normalizePriceIdList = (ids = []) => {
+    const source = Array.isArray(ids) ? ids : [];
+    const normalized = [];
+    const seen = new Set();
+    for (const raw of source) {
+      const text = String(raw ?? "").trim();
+      if (!text || seen.has(text)) continue;
+      if (!/^\d+$/.test(text)) continue;
+      seen.add(text);
+      normalized.push(text);
+    }
+    return normalized;
+  };
+
+  const readCachedPlayerPrice = (playerId) => {
+    const key = playerId == null ? null : String(playerId).trim();
+    if (!key) return null;
+    const cached = playerPriceCache.get(key);
+    if (!cached) return null;
+    const cachedAt = readNumeric(cached?.cachedAt) ?? 0;
+    if (Date.now() - cachedAt > PRICE_CACHE_TTL_MS) return null;
+    return cached;
+  };
+
+  const formatCoinAmount = (value) => {
+    const n = readNumeric(value);
+    if (n == null) return "n/a";
+    if (n >= 1000000) {
+      const m = n / 1000000;
+      return `${m >= 10 ? Math.round(m) : Math.round(m * 10) / 10}M`;
+    }
+    if (n >= 1000) return `${Math.round(n / 1000)}K`;
+    return String(Math.round(n));
+  };
+
+  const getPlayerPriceMeta = (playerId) => readCachedPlayerPrice(playerId);
+
+  const isPlayerPriceLoading = (playerId) => {
+    const key = playerId == null ? null : String(playerId).trim();
+    return Boolean(
+      key &&
+        (playerPriceInFlightKeys.has(key) ||
+          playerPriceInFlightPromises.has(key)),
+    );
+  };
+
+  const getPlayerPriceLabel = (priceMeta) => {
+    if (priceMeta?.loading) return "Price loading";
+    if (!priceMeta) return "Price n/a";
+    if (priceMeta?.isExtinct) return "Extinct";
+    const price = readNumeric(priceMeta?.price);
+    if (price == null) return "Price n/a";
+    return `${formatCoinAmount(price)} coins`;
+  };
+
+  const getPlayerPriceHeatClass = (priceMeta) => {
+    if (priceMeta?.loading) return "ea-data-pill--price-loading";
+    if (!priceMeta) return "ea-data-pill--price-missing";
+    if (priceMeta?.isExtinct) return "ea-data-pill--price-extinct";
+    const price = readNumeric(priceMeta?.price);
+    if (price == null) return "ea-data-pill--price-missing";
+    if (price < 1000) return "ea-data-pill--price-0";
+    if (price < 5000) return "ea-data-pill--price-1";
+    if (price < 15000) return "ea-data-pill--price-2";
+    if (price < 50000) return "ea-data-pill--price-3";
+    if (price < 150000) return "ea-data-pill--price-4";
+    if (price < 500000) return "ea-data-pill--price-5";
+    return "ea-data-pill--price-6";
+  };
+
+  const getEffectivePlayerPriceMeta = (rowOrId) => {
+    if (rowOrId && typeof rowOrId === "object") {
+      const id = rowOrId?.priceLookupId ?? rowOrId?.definitionId;
+      const cached = getPlayerPriceMeta(id);
+      if (cached) return cached;
+      const rowMeta = rowOrId?.priceMeta ?? null;
+      if (rowMeta && !rowMeta?.loading) return rowMeta;
+      return isPlayerPriceLoading(id) ? { loading: true } : null;
+    }
+    const id = rowOrId;
+    const meta = getPlayerPriceMeta(id);
+    if (meta) return meta;
+    return isPlayerPriceLoading(id) ? { loading: true } : null;
+  };
+
+  const attachPricesToPreviewRows = (rows = []) => {
+    const list = Array.isArray(rows) ? rows : [];
+    for (const row of list) {
+      if (!row || typeof row !== "object") continue;
+      row.priceMeta = getEffectivePlayerPriceMeta(row);
+    }
+    return list;
+  };
+
+  const summarizePreviewRowPrices = (rows = []) => {
+    const list = Array.isArray(rows) ? rows : [];
+    let total = 0;
+    let priced = 0;
+    let extinct = 0;
+    let missing = 0;
+    for (const row of list) {
+      const meta = getEffectivePlayerPriceMeta(row);
+      if (!meta) {
+        missing += 1;
+        continue;
+      }
+      if (meta?.isExtinct) {
+        extinct += 1;
+        continue;
+      }
+      const price = readNumeric(meta?.price);
+      if (price == null) {
+        missing += 1;
+        continue;
+      }
+      total += price;
+      priced += 1;
+    }
+    return { total, priced, extinct, missing, count: list.length };
+  };
+
+  const appendPricePill = (container, priceMeta) => {
+    if (!container) return null;
+    const pill = document.createElement("span");
+    pill.className = `ea-data-pill ea-data-pill--price ${getPlayerPriceHeatClass(
+      priceMeta,
+    )}`;
+    pill.textContent = getPlayerPriceLabel(priceMeta);
+    container.append(pill);
+    return pill;
+  };
+
+  const callPriceBridge = (ids = [], timeoutMs = PRICE_BRIDGE_TIMEOUT_MS) =>
+    new Promise((resolve, reject) => {
+      const requestId = crypto.randomUUID();
+      const timer = setTimeout(() => {
+        priceBridgeRequests.delete(requestId);
+        reject(new Error("Price request timed out"));
+      }, Math.max(1000, readNumeric(timeoutMs) ?? PRICE_BRIDGE_TIMEOUT_MS));
+      priceBridgeRequests.set(requestId, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      try {
+        window.postMessage(
+          {
+            type: PRICE_BRIDGE_REQUEST,
+            requestId,
+            ids: normalizePriceIdList(ids),
+            source: SOLVER_BRIDGE_SOURCE,
+          },
+          "*",
+        );
+      } catch (error) {
+        clearTimeout(timer);
+        priceBridgeRequests.delete(requestId);
+        reject(error);
+      }
+    });
+
+  const requestPlayerPricesForIds = (ids = [], { onDone = null } = {}) => {
+    const normalized = normalizePriceIdList(ids);
+    const applyPriceResult = (result) => {
+        const prices = result?.prices && typeof result.prices === "object"
+          ? result.prices
+          : {};
+        for (const [id, meta] of Object.entries(prices)) {
+          playerPriceCache.set(String(id), {
+            ...(meta && typeof meta === "object" ? meta : {}),
+            eaId: String(meta?.eaId ?? id),
+            cachedAt: readNumeric(meta?.cachedAt) ?? Date.now(),
+          });
+        }
+      };
+    const runBatch = async (batch, batchNumber, batchTotal) => {
+      for (const id of batch) playerPriceInFlightKeys.add(id);
+      try {
+        log("debug", "[EA Data] Price lookup batch start", {
+          batchNumber,
+          batchTotal,
+          count: batch.length,
+          ids: batch,
+        });
+        const result = await callPriceBridge(batch, PRICE_BRIDGE_TIMEOUT_MS);
+        applyPriceResult(result);
+        log("debug", "[EA Data] Price lookup batch complete", {
+          batchNumber,
+          batchTotal,
+          requestedCount: result?.requestedCount ?? batch.length,
+          fetchedCount: result?.fetchedCount ?? null,
+          returnedCount: Object.keys(result?.prices ?? {}).length,
+          errorCount: result?.errorCount ?? 0,
+        });
+        return result;
+      } catch (error) {
+        const message = error?.message || String(error);
+        const now = Date.now();
+        for (const id of batch) {
+          playerPriceCache.set(String(id), {
+            eaId: String(id),
+            price: null,
+            missing: true,
+            error: message,
+            cachedAt: now,
+          });
+        }
+        log("debug", "[EA Data] Price lookup batch failed", {
+          batchNumber,
+          batchTotal,
+          count: batch.length,
+          ids: batch,
+          message,
+        });
+        return {
+          requestedCount: batch.length,
+          fetchedCount: batch.length,
+          prices: {},
+          errorCount: 1,
+          errors: [{ ids: batch, message }],
+        };
+      } finally {
+        for (const id of batch) {
+          playerPriceInFlightKeys.delete(id);
+          playerPriceInFlightPromises.delete(id);
+        }
+      }
+    };
+
+    const run = async () => {
+      const uncached = normalized.filter((id) => !readCachedPlayerPrice(id));
+      if (!uncached.length) {
+        const combined = {
+          requestedCount: normalized.length,
+          fetchedCount: 0,
+          batchCount: 0,
+          errorCount: 0,
+          errors: [],
+        };
+        try {
+          if (typeof onDone === "function") onDone(combined);
+        } catch {}
+        return combined;
+      }
+      const results = [];
+      const errors = [];
+      const newIds = uncached.filter(
+        (id) => !playerPriceInFlightPromises.has(id),
+      );
+      const batchTotal = Math.ceil(newIds.length / PRICE_BRIDGE_BATCH_SIZE);
+      for (let index = 0; index < newIds.length; index += PRICE_BRIDGE_BATCH_SIZE) {
+        const batch = newIds.slice(index, index + PRICE_BRIDGE_BATCH_SIZE);
+        const batchNumber = Math.floor(index / PRICE_BRIDGE_BATCH_SIZE) + 1;
+        const promise = runBatch(batch, batchNumber, batchTotal);
+        for (const id of batch) {
+          playerPriceInFlightPromises.set(id, promise);
+        }
+      }
+      const promises = Array.from(
+        new Set(
+          uncached
+            .map((id) => playerPriceInFlightPromises.get(id))
+            .filter(Boolean),
+        ),
+      );
+      const settled = await Promise.all(promises);
+      for (const result of settled) {
+        results.push(result);
+        if ((readNumeric(result?.errorCount) ?? 0) > 0) {
+          errors.push(...(Array.isArray(result?.errors) ? result.errors : []));
+        }
+      }
+      const combined = {
+        requestedCount: normalized.length,
+        fetchedCount: uncached.length,
+        batchCount: results.length,
+        errorCount: errors.length,
+        errors,
+      };
+      if (errors.length) {
+        log("debug", "[EA Data] Price lookup returned partial results", combined);
+      }
+      try {
+        if (typeof onDone === "function") onDone(combined);
+      } catch {}
+      return combined;
+    };
+    return run()
+      .catch((error) => {
+        log("debug", "[EA Data] Price lookup failed", {
+          message: error?.message || String(error),
+          count: normalized.length,
+        });
+        throw error;
+      });
+  };
+
+  const requestPlayerPricesForRows = (rows = [], options = {}) => {
+    const ids = (Array.isArray(rows) ? rows : [])
+      .map((row) => row?.priceLookupId ?? row?.definitionId)
+      .filter((id) => id != null);
+    return requestPlayerPricesForIds(ids, options);
+  };
+
+  const fetchPricesForPreviewRows = async (
+    rows = [],
+    { onProgress = null, onLoading = null } = {},
+  ) => {
+    const list = attachPricesToPreviewRows(rows);
+    const missing = normalizePriceIdList(
+      list
+        .filter((row) => {
+          const meta = getEffectivePlayerPriceMeta(row);
+          return !meta || meta?.loading;
+        })
+        .map((row) => row?.priceLookupId ?? row?.definitionId),
+    );
+    if (!missing.length) return summarizePreviewRowPrices(list);
+    try {
+      if (typeof onProgress === "function") onProgress(missing.length);
+    } catch {}
+    for (const row of list) {
+      const key = row?.priceLookupId ?? row?.definitionId;
+      if (key != null && missing.includes(String(key))) {
+        row.priceMeta = { loading: true };
+      }
+    }
+    try {
+      if (typeof onLoading === "function") onLoading(list);
+    } catch {}
+    await requestPlayerPricesForIds(missing);
+    attachPricesToPreviewRows(list);
+    return summarizePreviewRowPrices(list);
+  };
+
+  const buildRowsForSolutionEntries = (
+    entries = [],
+    { playerById = null, sortKey = "slot" } = {},
+  ) => {
+    const rows = [];
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (entry?.status && entry.status !== "solved") continue;
+      rows.push(
+        ...buildPreviewRows({
+          solutionIds: Array.isArray(entry?.solutionIds) ? entry.solutionIds : [],
+          slotSolution: entry?.slotSolution ?? null,
+          playerById,
+          slotIndexToPositionName: entry?.slotIndexToPositionName ?? null,
+          sortKey,
+        }),
+      );
+    }
+    return attachPricesToPreviewRows(rows);
+  };
+
+  const buildRowsForSolvedSolution = ({
+    solutionIds = [],
+    slotSolution = null,
+    playerById = null,
+    slotIndexToPositionName = null,
+    sortKey = "slot",
+  } = {}) =>
+    attachPricesToPreviewRows(
+      buildPreviewRows({
+        solutionIds,
+        slotSolution,
+        playerById,
+        slotIndexToPositionName,
+        sortKey,
+      }),
+    );
 
   const readExtensionMetadata = () => {
     const root = document?.documentElement ?? null;
@@ -5111,6 +5500,7 @@
   const topbarSupportWrapperByView = new WeakMap();
   const solverBridgeRequests = new Map();
   const prefBridgeRequests = new Map();
+  const priceBridgeRequests = new Map();
   // Solve can occasionally take longer (large clubs / chemistry local search).
   // Keep init short, but allow solve to run longer before timing out.
   const SOLVER_BRIDGE_TIMEOUT_MS = 60000;
@@ -5126,8 +5516,13 @@
   const PREF_BRIDGE_GET = "EA_DATA_PREF_GET";
   const PREF_BRIDGE_SET = "EA_DATA_PREF_SET";
   const PREF_BRIDGE_RES = "EA_DATA_PREF_RES";
+  const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
+  const PRICE_BRIDGE_RESPONSE = "EA_DATA_PRICE_RESPONSE";
   const PREF_STORAGE_KEY = "eaData.preferences.v1";
   const PREF_BRIDGE_TIMEOUT_MS = 3500;
+  const PRICE_BRIDGE_TIMEOUT_MS = 25000;
+  const PRICE_BRIDGE_BATCH_SIZE = 10;
+  const PRICE_CACHE_TTL_MS = 10 * 60 * 1000;
   const PAGE_BRIDGE_TIMEOUT_MS = 12000;
   const PREF_CACHE_TTL_MS = 10 * 1000;
   const CHANGELOG_DATA_PATH = "data/changelog.json";
@@ -5146,6 +5541,9 @@
   let preferencesCache = null; // { at: number, value: object }
   let preferencesInFlight = null;
   let changelogCache = null;
+  const playerPriceCache = new Map(); // playerId(string) -> FUT.GG price metadata
+  const playerPriceInFlightKeys = new Set();
+  const playerPriceInFlightPromises = new Map(); // playerId(string) -> Promise
   let changelogInFlight = null;
   let topbarSupportObserver = null;
   let topbarSupportObserverStarted = false;
@@ -9440,6 +9838,7 @@
         slotIndexToPositionName: slotIndexToPos,
         sortKey: String(multiSolveOverlayState?.sortKey ?? "rating_desc"),
       });
+      attachPricesToPreviewRows(rows);
 
       for (const data of rows) {
         const playerId = data.playerId ?? null;
@@ -9503,6 +9902,10 @@
           pill.textContent = "Special";
           right.append(pill);
         }
+        appendPricePill(
+          right,
+          getEffectivePlayerPriceMeta(data),
+        );
 
         if (onPosVal === false) {
           const pill = document.createElement("span");
@@ -9533,8 +9936,18 @@
         const ratingCounts = new Map();
         let usedPlayers = 0;
         let usedSpecial = 0;
+        const allRows = [];
         for (const s of solutions) {
           const ids = Array.isArray(s?.solutionIds) ? s.solutionIds : [];
+          const rowsForSolution = buildPreviewRows({
+            solutionIds: ids,
+            slotSolution: s?.slotSolution ?? null,
+            playerById,
+            slotIndexToPositionName: slotIndexToPos,
+            sortKey: "slot",
+          });
+          attachPricesToPreviewRows(rowsForSolution);
+          allRows.push(...rowsForSolution);
           for (const id of ids) {
             if (id == null) continue;
             usedPlayers += 1;
@@ -9544,6 +9957,7 @@
             if (p?.isSpecial) usedSpecial += 1;
           }
         }
+        const priceSummary = summarizePreviewRowPrices(allRows);
 
         const summary = document.createElement("div");
         summary.className = "ea-data-used-summary";
@@ -9575,6 +9989,14 @@
         specialPill.textContent = `Special ${usedSpecial}`;
         topRight.append(specialPill);
 
+        const pricePill = document.createElement("span");
+        pricePill.className = "ea-data-pill ea-data-pill--rating";
+        pricePill.textContent =
+          priceSummary.priced > 0
+            ? `Total ${formatCoinAmount(priceSummary.total)}`
+            : "Total n/a";
+        topRight.append(pricePill);
+
         top.append(titleEl);
         top.append(topRight);
         summary.append(top);
@@ -9597,6 +10019,17 @@
             pill.textContent = `${rating}\u00D7${count}`;
             pills.append(pill);
           }
+        }
+
+        const pricedPill = document.createElement("span");
+        pricedPill.className = "ea-data-pill";
+        pricedPill.textContent = `Prices ${priceSummary.priced}/${priceSummary.count}`;
+        pills.append(pricedPill);
+        if (priceSummary.extinct > 0) {
+          const extinctPill = document.createElement("span");
+          extinctPill.className = "ea-data-pill ea-data-pill--warn";
+          extinctPill.textContent = `Extinct ${priceSummary.extinct}`;
+          pills.append(extinctPill);
         }
 
         summary.append(pills);
@@ -10115,6 +10548,23 @@
           });
           multiSolveOverlayState.solutions = solutions;
           setProgress(i + 1, times);
+          renderSolutions();
+          setStatus(`Fetching prices for solution ${i + 1} / ${times}...`);
+          await fetchPricesForPreviewRows(
+            buildRowsForSolvedSolution({
+              solutionIds,
+              slotSolution,
+              playerById,
+              slotIndexToPositionName,
+            }),
+            {
+              onLoading: () => renderSolutions(),
+              onProgress: (count) =>
+                setStatus(
+                  `Fetching prices for solution ${i + 1} / ${times} (${count} player(s))...`,
+                ),
+            },
+          );
           renderSolutions();
         }
 
@@ -11788,6 +12238,7 @@
             slotIndexToPositionName: entry?.slotIndexToPositionName ?? null,
             sortKey,
           });
+          attachPricesToPreviewRows(rows);
 
           for (const rowData of rows) {
             const row = document.createElement("div");
@@ -11840,6 +12291,10 @@
               pill.textContent = "Special";
               right.append(pill);
             }
+            appendPricePill(
+              right,
+              getEffectivePlayerPriceMeta(rowData),
+            );
             if (rowData.onPosVal === false) {
               const pill = document.createElement("span");
               pill.className = "ea-data-pill ea-data-pill--warn";
@@ -11993,6 +12448,7 @@
           let usedPlayers = 0;
           let usedSpecial = 0;
           let totalSolutions = 0;
+          const allRows = [];
           for (const c of cycleResults) {
             const ents = Array.isArray(c?.entries) ? c.entries : [];
             for (const ent of ents) {
@@ -12001,6 +12457,15 @@
               const ids = Array.isArray(ent?.solutionIds)
                 ? ent.solutionIds
                 : [];
+              const rowsForEntry = buildPreviewRows({
+                solutionIds: ids,
+                slotSolution: ent?.slotSolution ?? null,
+                playerById,
+                slotIndexToPositionName: ent?.slotIndexToPositionName ?? null,
+                sortKey: "slot",
+              });
+              attachPricesToPreviewRows(rowsForEntry);
+              allRows.push(...rowsForEntry);
               for (const id of ids) {
                 if (id == null) continue;
                 usedPlayers += 1;
@@ -12012,6 +12477,7 @@
               }
             }
           }
+          const priceSummary = summarizePreviewRowPrices(allRows);
 
           const summary = document.createElement("div");
           summary.className = "ea-data-used-summary";
@@ -12046,6 +12512,14 @@
           specialPill.textContent = `Special ${usedSpecial}`;
           topRight.append(specialPill);
 
+          const pricePill = document.createElement("span");
+          pricePill.className = "ea-data-pill ea-data-pill--rating";
+          pricePill.textContent =
+            priceSummary.priced > 0
+              ? `Total ${formatCoinAmount(priceSummary.total)}`
+              : "Total n/a";
+          topRight.append(pricePill);
+
           topNode.append(titleEl);
           topNode.append(topRight);
           summary.append(topNode);
@@ -12068,6 +12542,17 @@
               pill.textContent = `${rating}\u00D7${count}`;
               pillsNode.append(pill);
             }
+          }
+
+          const pricedPill = document.createElement("span");
+          pricedPill.className = "ea-data-pill";
+          pricedPill.textContent = `Prices ${priceSummary.priced}/${priceSummary.count}`;
+          pillsNode.append(pricedPill);
+          if (priceSummary.extinct > 0) {
+            const extinctPill = document.createElement("span");
+            extinctPill.className = "ea-data-pill ea-data-pill--warn";
+            extinctPill.textContent = `Extinct ${priceSummary.extinct}`;
+            pillsNode.append(extinctPill);
           }
 
           summary.append(pillsNode);
@@ -12254,6 +12739,7 @@
           const isSpecial = Boolean(player?.isSpecial);
           const chemVal = perChem?.[i];
           const onPosVal = onPos?.[i];
+          const priceLookupId = definitionId ?? playerId;
 
           rows.push({
             originalIndex: i,
@@ -12265,9 +12751,11 @@
             name,
             rarity,
             definitionId,
+            priceLookupId,
             isSpecial,
             chemVal,
             onPosVal,
+            priceMeta: readCachedPlayerPrice(priceLookupId),
           });
         }
 
@@ -12284,6 +12772,7 @@
         } else {
           rows.sort((a, b) => a.originalIndex - b.originalIndex);
         }
+        attachPricesToPreviewRows(rows);
 
         for (const rowData of rows) {
           const row = document.createElement("div");
@@ -12336,6 +12825,10 @@
             pill.textContent = "Special";
             right.append(pill);
           }
+          appendPricePill(
+            right,
+            getEffectivePlayerPriceMeta(rowData),
+          );
           if (rowData.onPosVal === false) {
             const pill = document.createElement("span");
             pill.className = "ea-data-pill ea-data-pill--warn";
@@ -12372,11 +12865,21 @@
         let usedPlayers = 0;
         let usedSpecial = 0;
         const ratingCounts = new Map();
+        const allRows = [];
         for (const item of entries) {
           if (item?.status === "solved") solvedCount += 1;
           else failedCount += 1;
           if (item?.submitState === "submitted") submittedCount += 1;
           const ids = Array.isArray(item?.solutionIds) ? item.solutionIds : [];
+          const rowsForEntry = buildPreviewRows({
+            solutionIds: ids,
+            slotSolution: item?.slotSolution ?? null,
+            playerById,
+            slotIndexToPositionName: item?.slotIndexToPositionName ?? null,
+            sortKey: "slot",
+          });
+          attachPricesToPreviewRows(rowsForEntry);
+          allRows.push(...rowsForEntry);
           for (const id of ids) {
             if (id == null) continue;
             usedPlayers += 1;
@@ -12386,6 +12889,7 @@
             if (p?.isSpecial) usedSpecial += 1;
           }
         }
+        const priceSummary = summarizePreviewRowPrices(allRows);
 
         const summary = document.createElement("div");
         summary.className = "ea-data-used-summary";
@@ -12433,6 +12937,14 @@
         specialPill.textContent = `Special ${usedSpecial}`;
         topRight.append(specialPill);
 
+        const pricePill = document.createElement("span");
+        pricePill.className = "ea-data-pill ea-data-pill--rating";
+        pricePill.textContent =
+          priceSummary.priced > 0
+            ? `Total ${formatCoinAmount(priceSummary.total)}`
+            : "Total n/a";
+        topRight.append(pricePill);
+
         top.append(titleEl);
         top.append(topRight);
         summary.append(top);
@@ -12460,6 +12972,17 @@
             pill.textContent = `${rating}x${count}`;
             pills.append(pill);
           }
+        }
+
+        const pricedPill = document.createElement("span");
+        pricedPill.className = "ea-data-pill";
+        pricedPill.textContent = `Prices ${priceSummary.priced}/${priceSummary.count}`;
+        pills.append(pricedPill);
+        if (priceSummary.extinct > 0) {
+          const extinctPill = document.createElement("span");
+          extinctPill.className = "ea-data-pill ea-data-pill--warn";
+          extinctPill.textContent = `Extinct ${priceSummary.extinct}`;
+          pills.append(extinctPill);
         }
 
         summary.append(pills);
@@ -13506,7 +14029,7 @@
                 if (id == null) continue;
                 if (playerById?.get?.(String(id))?.isSpecial) specialCount += 1;
               }
-              entries.push({
+              const entry = {
                 challengeId: challenge?.id ?? null,
                 challengeName,
                 status: "solved",
@@ -13519,7 +14042,29 @@
                 specialCount,
                 stats: result?.stats ?? null,
                 submitState: null,
-              });
+              };
+              entries.push(entry);
+              setSolveOverlayState.entries = entries;
+              renderEntries();
+              setStatus(
+                `(${i + 1}/${filteredChallenges.length}) Fetching prices for ${challengeName}...`,
+              );
+              await fetchPricesForPreviewRows(
+                buildRowsForSolvedSolution({
+                  solutionIds,
+                  slotSolution: entry.slotSolution,
+                  playerById,
+                  slotIndexToPositionName: entry.slotIndexToPositionName,
+                }),
+              {
+                  onLoading: () => renderEntries(),
+                  onProgress: (count) =>
+                    setStatus(
+                      `(${i + 1}/${filteredChallenges.length}) Fetching prices for ${challengeName} (${count} player(s))...`,
+                    ),
+                },
+              );
+              renderEntries();
             } else {
               const failing = Array.isArray(result?.failingRequirements)
                 ? result.failingRequirements
@@ -13784,7 +14329,7 @@
               if (id == null) continue;
               if (playerById?.get?.(String(id))?.isSpecial) specialCount += 1;
             }
-            cycleEntries.push({
+            const entry = {
               challengeId: challenge?.id ?? null,
               challengeName,
               status: "solved",
@@ -13797,7 +14342,26 @@
               specialCount,
               stats: result?.stats ?? null,
               submitState: null,
-            });
+            };
+            cycleEntries.push(entry);
+            setStatus(
+              `(Cycle ${cycleIndex}/${targetCycles}) (${i + 1}/${filteredChallenges.length}) Fetching prices for ${challengeName}...`,
+            );
+            await fetchPricesForPreviewRows(
+              buildRowsForSolvedSolution({
+                solutionIds,
+                slotSolution: entry.slotSolution,
+                playerById,
+                slotIndexToPositionName: entry.slotIndexToPositionName,
+              }),
+              {
+                onLoading: () => renderEntries(),
+                onProgress: (count) =>
+                  setStatus(
+                    `(Cycle ${cycleIndex}/${targetCycles}) (${i + 1}/${filteredChallenges.length}) Fetching prices for ${challengeName} (${count} player(s))...`,
+                  ),
+              },
+            );
             completedWork += 1;
             setProgress(completedWork, totalWork);
           }
@@ -16303,6 +16867,11 @@
       const usedEntries = Array.isArray(usedSummary?.entries)
         ? usedSummary.entries
         : [];
+      const usedPriceRows = usedEntries.flatMap((entry) =>
+        Array.isArray(entry?.rows) ? entry.rows : [],
+      );
+      attachPricesToPreviewRows(usedPriceRows);
+      const usedPriceSummary = summarizePreviewRowPrices(usedPriceRows);
       const maxUsedIndex = Math.max(0, usedEntries.length - 1);
       const activeUsedIndex = clampInt(
         state?.usedSummaryIndex ?? 0,
@@ -16321,8 +16890,16 @@
               sanitizeDisplayText(activeUsedEntry?.stepLabel) ?? "Sequence Step";
             const playersLabel = readNumeric(activeUsedEntry?.playerCount) ?? 0;
             const specialLabel = readNumeric(activeUsedEntry?.specialCount) ?? 0;
+            const entryRows = attachPricesToPreviewRows(
+              activeUsedEntry?.rows ?? [],
+            );
+            const entryPriceSummary = summarizePreviewRowPrices(entryRows);
             const pageLabel = `${activeUsedIndex + 1} / ${usedEntries.length}`;
-            const statusLine = `Players ${playersLabel} | Special ${specialLabel}`;
+            const statusLine = `Players ${playersLabel} | Special ${specialLabel} | Total ${
+              entryPriceSummary.priced > 0
+                ? formatCoinAmount(entryPriceSummary.total)
+                : "n/a"
+            }`;
             return `
               <div class="ea-data-sequence-used-entry">
                 <div class="ea-data-sequence-used-header">
@@ -16356,13 +16933,18 @@
                       <span class="ea-data-pill${
                         specialLabel > 0 ? " ea-data-pill--special" : ""
                       }">Special ${escapeHtml(specialLabel)}</span>
+                      <span class="ea-data-pill ea-data-pill--rating">Total ${escapeHtml(
+                        entryPriceSummary.priced > 0
+                          ? formatCoinAmount(entryPriceSummary.total)
+                          : "n/a",
+                      )}</span>
                     </div>
                   </div>
                 </div>
                 <div class="ea-data-sequence-used-meta">${escapeHtml(
                   statusLine,
                 )}</div>
-                ${renderPreviewRowsMarkup(activeUsedEntry?.rows ?? [])}
+                ${renderPreviewRowsMarkup(entryRows)}
               </div>
             `;
           })()
@@ -16392,6 +16974,21 @@
             )
             .join("")
         : `<span class="ea-data-pill">${escapeHtml(usedEmptyText)}</span>`;
+      const usedPricePills = [
+        `<span class="ea-data-pill ea-data-pill--rating">Total ${escapeHtml(
+          usedPriceSummary.priced > 0
+            ? formatCoinAmount(usedPriceSummary.total)
+            : "n/a",
+        )}</span>`,
+        `<span class="ea-data-pill">Prices ${escapeHtml(
+          `${usedPriceSummary.priced}/${usedPriceSummary.count}`,
+        )}</span>`,
+        usedPriceSummary.extinct > 0
+          ? `<span class="ea-data-pill ea-data-pill--warn">Extinct ${escapeHtml(
+              usedPriceSummary.extinct,
+            )}</span>`
+          : "",
+      ].join("");
       const runtimeSteps = Array.isArray(runState?.steps) ? runState.steps : [];
       const latestFailureContext =
         runState?.latestFailureContext &&
@@ -16650,9 +17247,14 @@
                   }">Special ${escapeHtml(
                     usedSummary?.specialCount ?? 0,
                   )}</span>
+                  <span class="ea-data-pill ea-data-pill--rating">Total ${escapeHtml(
+                    usedPriceSummary.priced > 0
+                      ? formatCoinAmount(usedPriceSummary.total)
+                      : "n/a",
+                  )}</span>
                 </div>
               </div>
-              <div class="ea-data-used-summary-pills">${usedRatingPills}</div>
+              <div class="ea-data-used-summary-pills">${usedRatingPills}${usedPricePills}</div>
             </div>
             <div class="ea-data-sequence-runtime-steps">${stepRows}</div>
           </div>
@@ -17548,7 +18150,7 @@
       }
       if (phase === "solving") return 2;
       if (phase === "applying") return 3;
-      if (phase === "submitting") return 4;
+      if (phase === "submitting" || phase === "pricing") return 4;
       if (
         phase === "solved" ||
         phase === "skipped" ||
@@ -17650,7 +18252,7 @@
           entrySpecialCount += 1;
         }
       }
-      summary.entries.push({
+      const entry = {
         challengeId: descriptor?.challengeId ?? null,
         challengeIndex: readNumeric(descriptor?.challengeIndex),
         challengeName:
@@ -17669,13 +18271,16 @@
           slotIndexToPositionName,
           sortKey: "slot",
         }),
-      });
+      };
+      attachPricesToPreviewRows(entry.rows);
+      summary.entries.push(entry);
       if (sequenceSolveOverlayState) {
         sequenceSolveOverlayState.usedSummaryIndex = Math.max(
           0,
           summary.entries.length - 1,
         );
       }
+      return entry;
     };
 
     const estimateStepOpenChallenges = async (step) => {
@@ -18121,7 +18726,7 @@
       }
 
       if (recordUsage) {
-        recordRunUsedPlayers(solutionIds, runContext, {
+        const usedEntry = recordRunUsedPlayers(solutionIds, runContext, {
           descriptor,
           step,
           stepLabel:
@@ -18135,6 +18740,18 @@
           slotIndexToPositionName:
             plannedSubmission?.slotIndexToPositionName ?? null,
         });
+        if (usedEntry?.rows?.length) {
+          notifyPhase("pricing", `Fetching prices for ${challengeName}...`);
+          await fetchPricesForPreviewRows(usedEntry.rows, {
+            onLoading: () => sequenceSolveOverlayState?.renderExecutionPanel?.(),
+            onProgress: (count) =>
+              notifyPhase(
+                "pricing",
+                `Fetching prices for ${challengeName} (${count} player(s))...`,
+              ),
+          });
+          sequenceSolveOverlayState?.renderExecutionPanel?.();
+        }
       }
       if (updateUsedPool && runContext?.usedPlayerIds?.add) {
         for (const id of solutionIds) {
@@ -18460,13 +19077,25 @@
       };
 
       if (!submit) {
-        recordRunUsedPlayers(solutionIds, runContext, {
+        const usedEntry = recordRunUsedPlayers(solutionIds, runContext, {
           descriptor,
           step,
           stepLabel: plannedSubmission.stepLabel,
           slotSolution: plannedSubmission.slotSolution,
           slotIndexToPositionName: plannedSubmission.slotIndexToPositionName,
         });
+        if (usedEntry?.rows?.length) {
+          notifyPhase("pricing", `Fetching prices for ${challengeName}...`);
+          await fetchPricesForPreviewRows(usedEntry.rows, {
+            onLoading: () => sequenceSolveOverlayState?.renderExecutionPanel?.(),
+            onProgress: (count) =>
+              notifyPhase(
+                "pricing",
+                `Fetching prices for ${challengeName} (${count} player(s))...`,
+              ),
+          });
+          sequenceSolveOverlayState?.renderExecutionPanel?.();
+        }
         for (const id of solutionIds) {
           if (id == null) continue;
           runContext.usedPlayerIds.add(String(id));
@@ -26288,6 +26917,15 @@
       else pending.reject(data.error);
       return;
     }
+    if (type === PRICE_BRIDGE_RESPONSE && requestId) {
+      if (source !== SOLVER_BRIDGE_SOURCE) return;
+      const pending = priceBridgeRequests.get(requestId);
+      if (!pending) return;
+      priceBridgeRequests.delete(requestId);
+      if (data.ok) pending.resolve(data.data);
+      else pending.reject(data.error);
+      return;
+    }
     if (type === SOLVER_BRIDGE_RESPONSE && requestId) {
       if (source !== SOLVER_BRIDGE_SOURCE) return;
       const pending = solverBridgeRequests.get(requestId);
@@ -26301,6 +26939,7 @@
     if (
       (type === PREF_BRIDGE_GET ||
         type === PREF_BRIDGE_SET ||
+        type === PRICE_BRIDGE_REQUEST ||
         type === SOLVER_BRIDGE_REQUEST) &&
       requestId
     ) {

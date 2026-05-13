@@ -18,6 +18,7 @@
     }
   },
   "permissions": ["storage", "scripting"],
+  "host_permissions": ["https://www.fut.gg/*"],
   "background": {
     "service_worker": "background.js",
     "type": "module"

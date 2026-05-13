@@ -199,6 +199,8 @@ const PREF_BRIDGE_GET = "EA_DATA_PREF_GET";
 const PREF_BRIDGE_SET = "EA_DATA_PREF_SET";
 const PREF_BRIDGE_RES = "EA_DATA_PREF_RES";
 const PREF_ALLOWED_KEYS = new Set(["eaData.preferences.v1"]);
+const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
+const PRICE_BRIDGE_RESPONSE = "EA_DATA_PRICE_RESPONSE";
 
 // Relay page-world log messages to the content-script console.
 // The page script (ea-data-bridge.js) runs in the main world where EA overrides
@@ -585,6 +587,83 @@ const handlePrefBridgeRequest = async (data) => {
   }
 };
 
+const postPriceResponse = (requestId, ok, data, error) => {
+  const detail = {
+    type: PRICE_BRIDGE_RESPONSE,
+    requestId,
+    ok: Boolean(ok),
+    data,
+    error,
+    source: SOLVER_BRIDGE_SOURCE,
+  };
+  try {
+    window.postMessage(detail, "*");
+  } catch {}
+};
+
+const handlePriceBridgeRequest = async (data) => {
+  if (window !== window.top) return;
+  const { type, requestId, source, ids } = data || {};
+  if (type !== PRICE_BRIDGE_REQUEST) return;
+  if (!requestId) return;
+  if (source !== SOLVER_BRIDGE_SOURCE) return;
+  console.log("[EA Data] Price bridge request", {
+    requestId,
+    count: Array.isArray(ids) ? ids.length : 0,
+  });
+  try {
+    chrome.runtime.sendMessage(
+      {
+        type: PRICE_BRIDGE_REQUEST,
+        payload: { ids: Array.isArray(ids) ? ids : [], requestId },
+      },
+      (response) => {
+        const runtimeError = chrome.runtime?.lastError;
+        if (runtimeError) {
+          console.log("[EA Data] Price bridge runtime error", {
+            requestId,
+            message: runtimeError.message || "Price bridge failed",
+          });
+          postPriceResponse(requestId, false, null, {
+            code: "PRICE_BRIDGE_FAILED",
+            message: runtimeError.message || "Price bridge failed",
+          });
+          return;
+        }
+        if (response?.ok) {
+          console.log("[EA Data] Price bridge response", {
+            requestId,
+            ok: true,
+            requestedCount: response?.data?.requestedCount ?? null,
+            fetchedCount: response?.data?.fetchedCount ?? null,
+            errorCount: response?.data?.errorCount ?? null,
+          });
+          postPriceResponse(requestId, true, response.data, null);
+          return;
+        }
+        console.log("[EA Data] Price bridge response", {
+          requestId,
+          ok: false,
+          error: response?.error ?? null,
+        });
+        postPriceResponse(requestId, false, null, response?.error ?? {
+          code: "PRICE_BRIDGE_FAILED",
+          message: "Price bridge failed",
+        });
+      },
+    );
+  } catch (error) {
+    console.log("[EA Data] Price bridge exception", {
+      requestId,
+      message: error?.message || String(error),
+    });
+    postPriceResponse(requestId, false, null, {
+      code: "PRICE_BRIDGE_FAILED",
+      message: error?.message || "Price bridge failed",
+    });
+  }
+};
+
 window.addEventListener(
   "message",
   (event) => {
@@ -601,6 +680,16 @@ window.addEventListener(
     if (window !== window.top) return;
     if (!isTrustedPageMessageEvent(event)) return;
     handlePrefBridgeRequest(event.data);
+  },
+  true,
+);
+
+window.addEventListener(
+  "message",
+  (event) => {
+    if (window !== window.top) return;
+    if (!isTrustedPageMessageEvent(event)) return;
+    handlePriceBridgeRequest(event.data);
   },
   true,
 );
