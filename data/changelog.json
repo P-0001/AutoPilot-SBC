@@ -2,6 +2,17 @@
   "version": 1,
   "releases": [
     {
+      "version": "1.10",
+      "date": "2026-05-15",
+      "headline": "Smarter solver efficiency and card type controls.",
+      "summary": "Improved solver efficiency and added clearer control over which card types the solver can use.",
+      "details": [
+        "Added solved squad player pricing.",
+        "Improved solver efficiency so it should use less high rated player anchors.",
+        "Added card type pickers to the single, multi, and sequence solvers."
+      ]
+    },
+    {
       "version": "1.9.3",
       "date": "2026-05-08",
       "headline": "Improved sequence solver panel and solving algorithm.",

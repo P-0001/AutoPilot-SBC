@@ -171,6 +171,56 @@ const toBooleanSetting = (value, fallback = false) => {
 const normalizeString = (value) =>
   value == null ? null : String(value).trim().toLowerCase();
 
+const CARD_BUCKETS = Object.freeze([
+  "common_bronze",
+  "rare_bronze",
+  "common_silver",
+  "rare_silver",
+  "common_gold",
+  "rare_gold",
+]);
+const CARD_BUCKET_SET = new Set(CARD_BUCKETS);
+
+const normalizeCardBucketValue = (value) => {
+  const text = normalizeString(value);
+  if (!text) return null;
+  const normalized = text.replace(/[\s-]+/g, "_");
+  return CARD_BUCKET_SET.has(normalized) ? normalized : null;
+};
+
+const normalizeAllowedCardBuckets = (value, fallback = CARD_BUCKETS) => {
+  const source =
+    Array.isArray(value) || value instanceof Set
+      ? Array.from(value)
+      : value && typeof value === "object"
+        ? Object.entries(value)
+            .filter(([, enabled]) => enabled !== false)
+            .map(([key]) => key)
+        : [];
+  const normalized = [];
+  const seen = new Set();
+  for (const entry of source) {
+    const bucket = normalizeCardBucketValue(entry);
+    if (!bucket || seen.has(bucket)) continue;
+    seen.add(bucket);
+    normalized.push(bucket);
+  }
+  if (normalized.length) return normalized;
+  const fallbackList =
+    Array.isArray(fallback) || fallback instanceof Set
+      ? Array.from(fallback)
+      : CARD_BUCKETS;
+  const fallbackNormalized = [];
+  const fallbackSeen = new Set();
+  for (const entry of fallbackList) {
+    const bucket = normalizeCardBucketValue(entry);
+    if (!bucket || fallbackSeen.has(bucket)) continue;
+    fallbackSeen.add(bucket);
+    fallbackNormalized.push(bucket);
+  }
+  return fallbackNormalized.length ? fallbackNormalized : CARD_BUCKETS.slice();
+};
+
 const isTotwPlayer = (player) => {
   const rarity = normalizeString(player?.rarityName);
   if (rarity) {
@@ -189,6 +239,20 @@ const isTotsPlayer = (player) => {
 
 const isTotwOrTotsPlayer = (player) =>
   isTotwPlayer(player) || isTotsPlayer(player);
+
+const isRareBasePlayer = (player) => {
+  const rarity = normalizeString(player?.rarityName);
+  if (rarity?.includes("rare")) return true;
+  const rarityId = toNumber(player?.rarityId);
+  return rarityId != null ? rarityId >= 1 : false;
+};
+
+const getBaseCardBucket = (player) => {
+  if (!player || player?.isSpecial) return null;
+  const quality = player?.quality || getPlayerQuality(toNumber(player?.rating) ?? 0);
+  if (!QUALITY_ORDER[quality]) return null;
+  return `${isRareBasePlayer(player) ? "rare" : "common"}_${quality}`;
+};
 
 const extractValues = (value) => {
   if (value == null) return [];
@@ -521,6 +585,10 @@ export const buildSolverContext = ({
     excludeSpecial: toBooleanSetting(filters?.excludeSpecial, false),
     useTotwPlayers: toBooleanSetting(filters?.useTotwPlayers, true),
     useEvolutionPlayers: toBooleanSetting(filters?.useEvolutionPlayers, false),
+    allowedCardBuckets: normalizeAllowedCardBuckets(
+      filters?.allowedCardBuckets,
+      CARD_BUCKETS,
+    ),
     preserveOccupiedSlots: toBooleanSetting(
       filters?.preserveOccupiedSlots,
       false,
@@ -586,6 +654,17 @@ export const buildSolverContext = ({
       if (!player?.isSpecial || player?.isTotwOrTots) return true;
       if (player?.id == null) return false;
       return lockedSlotPlayerIds.has(String(player.id));
+    });
+  }
+  const allowedBucketSet = new Set(normalizedFilters.allowedCardBuckets);
+  if (allowedBucketSet.size < CARD_BUCKETS.length) {
+    normalizedPlayers = normalizedPlayers.filter((player) => {
+      if (player?.id != null && lockedSlotPlayerIds.has(String(player.id))) {
+        return true;
+      }
+      const bucket = getBaseCardBucket(player);
+      if (!bucket) return true;
+      return allowedBucketSet.has(bucket);
     });
   }
   const normalizedPrioritize = {
@@ -8156,6 +8235,10 @@ const buildFiltersFingerprint = (filters = {}) =>
     onlyDuplicates: toBooleanSetting(filters?.onlyDuplicates, false),
     ratingMin: toNumber(filters?.ratingMin) ?? null,
     ratingMax: toNumber(filters?.ratingMax) ?? null,
+    allowedCardBuckets: normalizeAllowedCardBuckets(
+      filters?.allowedCardBuckets,
+      CARD_BUCKETS,
+    ).sort(),
     excludedLeagueIds: (filters?.excludedLeagueIds || []).map(String).sort(),
     excludedNationIds: (filters?.excludedNationIds || []).map(String).sort(),
   });

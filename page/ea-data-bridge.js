@@ -5870,6 +5870,7 @@
         </div>
 
         <div class="ea-data-settings-section-label ea-data-settings-section-label--spaced">Player Pool Options</div>
+        ${renderCardBucketPicker({ idPrefix: "ea-data-setting-card-bucket-" })}
         <div class="ea-data-toggle-list">
           ${renderSolverToggleFields({ scope: "challenge", idPrefix: "ea-data-setting-" })}
         </div>
@@ -5901,6 +5902,10 @@
       root: overlay,
       scope: "challenge",
       idPrefix: "ea-data-setting-",
+    });
+    const cardBucketBinder = createCardBucketPickerBinder({
+      root: overlay,
+      idPrefix: "ea-data-setting-card-bucket-",
     });
     const localExclusionsEditor = attachLocalExclusionsEditor(
       localExclusionsMount,
@@ -6011,9 +6016,14 @@
 
       const poolSettings = toggleBinder.setValues(raw, previous);
       const normalizedSettings = normalizeSolverSettingsInput(raw, previous);
+      const cardBucketSettings = cardBucketBinder.setValues(
+        normalizedSettings,
+        previous,
+      );
 
       settingsOverlayState.current = {
         ratingRange: { ratingMin, ratingMax },
+        ...cardBucketSettings,
         ...poolSettings,
         excludedPlayerIds: normalizedSettings.excludedPlayerIds,
         excludedLeagueIds: normalizedSettings.excludedLeagueIds,
@@ -6102,6 +6112,7 @@
           : getDefaultSolverSettings();
       const next = {
         ratingRange: normalizeRatingRange(current.ratingRange),
+        ...cardBucketBinder.getValues(current),
         ...toggleBinder.getValues(current),
         ...localExclusionsEditor?.getLocalSettings?.(),
       };
@@ -9440,6 +9451,7 @@
         </div>
 
         <div class="ea-data-settings-section-label ea-data-settings-section-label--spaced">Player Pool Options</div>
+        ${renderCardBucketPicker({ idPrefix: "ea-data-multisolve-card-bucket-" })}
         <div class="ea-data-toggle-list">
           ${renderSolverToggleFields({ scope: "multi", idPrefix: "ea-data-multisolve-setting-" })}
         </div>
@@ -9526,6 +9538,10 @@
       scope: "multi",
       idPrefix: "ea-data-multisolve-setting-",
     });
+    const cardBucketBinder = createCardBucketPickerBinder({
+      root: overlay,
+      idPrefix: "ea-data-multisolve-card-bucket-",
+    });
     let syncingLocalExclusions = false;
     const localExclusionsEditor = attachLocalExclusionsEditor(
       localExclusionsMount,
@@ -9538,7 +9554,10 @@
           if (syncingLocalExclusions) return;
           try {
             multiSolveOverlayState.localExclusions = localSettings;
-            multiSolveOverlayState.effectivePoolSettings = effectiveSettings;
+            multiSolveOverlayState.effectivePoolSettings = {
+              ...effectiveSettings,
+              ...(multiSolveOverlayState?.cardBucketSettings ?? {}),
+            };
           } catch {}
         },
       },
@@ -9640,16 +9659,24 @@
         settings,
         getDefaultSolverSettings(),
       );
+      const cardBucketSettings = cardBucketBinder.setValues(
+        normalizedSettings,
+        multiSolveOverlayState?.effectivePoolSettings ??
+          multiSolveOverlayState?.globalSettings ??
+          getDefaultSolverSettings(),
+      );
       const localSettings = normalizeLocalExclusionSettings(
         multiSolveOverlayState?.localExclusions ?? normalizedSettings,
         getDefaultLocalExclusionSettings(),
       );
       try {
         multiSolveOverlayState.poolSettings = poolSettings;
+        multiSolveOverlayState.cardBucketSettings = cardBucketSettings;
         multiSolveOverlayState.localExclusions = localSettings;
         multiSolveOverlayState.effectivePoolSettings = mergeLocalExclusionsIntoSettings({
           settings: {
             ...normalizedSettings,
+            ...cardBucketSettings,
             ...poolSettings,
           },
           globalSettings: multiSolveOverlayState.globalSettings,
@@ -9661,6 +9688,7 @@
         localExclusionsEditor?.sync({
           settings: {
             ...normalizedSettings,
+            ...cardBucketSettings,
             ...poolSettings,
           },
           globalSettings: multiSolveOverlayState?.globalSettings,
@@ -9677,17 +9705,24 @@
           ? multiSolveOverlayState.poolSettings
           : getDefaultSolverPoolSettings();
       const poolSettings = toggleBinder.getValues(current);
+      const cardBucketSettings = cardBucketBinder.getValues(
+        multiSolveOverlayState?.cardBucketSettings ??
+          multiSolveOverlayState?.effectivePoolSettings ??
+          getDefaultSolverSettings(),
+      );
       const localSettings = normalizeLocalExclusionSettings(
         multiSolveOverlayState?.localExclusions,
         getDefaultLocalExclusionSettings(),
       );
       try {
         multiSolveOverlayState.poolSettings = poolSettings;
+        multiSolveOverlayState.cardBucketSettings = cardBucketSettings;
         multiSolveOverlayState.localExclusions = localSettings;
       } catch {}
       return mergeLocalExclusionsIntoSettings({
         settings: {
           ...current,
+          ...cardBucketSettings,
           ...poolSettings,
         },
         globalSettings: multiSolveOverlayState?.globalSettings,
@@ -10851,11 +10886,17 @@
       ratingMinInput,
       ratingMaxInput,
       toggleBinder,
+      cardBucketBinder,
       localExclusionsEditor,
       setStatus,
       ratingRange: ratingRangeCurrent,
       globalSettings: getDefaultSolverSettings(),
       poolSettings: getDefaultSolverPoolSettings(),
+      cardBucketSettings: {
+        allowedCardBuckets: getSettingDefault(
+          SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS,
+        ),
+      },
       localExclusions: getDefaultLocalExclusionSettings(),
       effectivePoolSettings: getDefaultSolverSettings(),
       challengeId: null,
@@ -17720,6 +17761,13 @@
             </div>
           </div>
           <div class="ea-data-sequence-field ea-data-sequence-field--span-2">
+            <label class="ea-data-sequence-label">Card Types</label>
+            ${renderCardBucketPicker({
+              idPrefix: `ea-data-sequence-${escapeHtml(normalizedStep?.id)}-card-bucket-`,
+              disabled: isRunning,
+            })}
+          </div>
+          <div class="ea-data-sequence-field ea-data-sequence-field--span-2">
             <label class="ea-data-sequence-label">Pool Options</label>
             <div class="ea-data-sequence-toggle-list">${toggleRows}</div>
           </div>
@@ -17847,6 +17895,39 @@
           ),
         );
       }
+      const cardBucketMounts = stepsPanelEl
+        ? Array.from(stepsPanelEl.querySelectorAll("[data-card-bucket-group]"))
+        : [];
+      for (const mount of cardBucketMounts) {
+        const card = mount.closest("[data-step-card-id]");
+        const stepId = card?.getAttribute("data-step-card-id");
+        const step = plan?.steps?.find(
+          (entry) => String(entry?.id) === String(stepId),
+        );
+        if (!step) continue;
+        const binder = createCardBucketPickerBinder({
+          root: mount,
+          idPrefix: `ea-data-sequence-${String(stepId)}-card-bucket-`,
+          onChange: ({ allowedCardBuckets }) => {
+            step.settingsSnapshot = normalizeSolverSettingsInput(
+              {
+                ...step.settingsSnapshot,
+                allowedCardBuckets,
+              },
+              sequenceSolveOverlayState?.defaultSettings ??
+                getDefaultSolverSettings(),
+            );
+            clearPendingSequenceReview();
+            touchPlans();
+            sequenceSolveOverlayState?.syncActions?.();
+          },
+        });
+        binder.setValues(
+          step?.settingsSnapshot,
+          sequenceSolveOverlayState?.defaultSettings ?? getDefaultSolverSettings(),
+        );
+        binder.setDisabled(isRunning);
+      }
       const editors = stepsPanelEl
         ? Array.from(stepsPanelEl.querySelectorAll("[data-sequence-local-editor]"))
         : [];
@@ -17864,6 +17945,7 @@
           onChange: ({ localSettings, effectiveSettings }) => {
             step.settingsSnapshot = normalizeSolverSettingsInput(
               {
+                ...step.settingsSnapshot,
                 ...effectiveSettings,
                 ...localSettings,
               },
@@ -21775,8 +21857,97 @@
     return null;
   };
 
+  const CARD_BUCKETS = Object.freeze([
+    Object.freeze({
+      key: "common_bronze",
+      label: "Common Bronze",
+      quality: "bronze",
+      rarity: "common",
+    }),
+    Object.freeze({
+      key: "rare_bronze",
+      label: "Rare Bronze",
+      quality: "bronze",
+      rarity: "rare",
+    }),
+    Object.freeze({
+      key: "common_silver",
+      label: "Common Silver",
+      quality: "silver",
+      rarity: "common",
+    }),
+    Object.freeze({
+      key: "rare_silver",
+      label: "Rare Silver",
+      quality: "silver",
+      rarity: "rare",
+    }),
+    Object.freeze({
+      key: "common_gold",
+      label: "Common Gold",
+      quality: "gold",
+      rarity: "common",
+    }),
+    Object.freeze({
+      key: "rare_gold",
+      label: "Rare Gold",
+      quality: "gold",
+      rarity: "rare",
+    }),
+  ]);
+  const CARD_BUCKET_KEYS = Object.freeze(CARD_BUCKETS.map((bucket) => bucket.key));
+  const CARD_BUCKET_KEY_SET = new Set(CARD_BUCKET_KEYS);
+
+  const normalizeCardBucketValue = (value) => {
+    if (value == null) return null;
+    const normalized = String(value).trim().toLowerCase().replace(/[\s-]+/g, "_");
+    return CARD_BUCKET_KEY_SET.has(normalized) ? normalized : null;
+  };
+
+  const normalizeAllowedCardBuckets = (value, fallback = CARD_BUCKET_KEYS) => {
+    const source =
+      Array.isArray(value) || value instanceof Set
+        ? Array.from(value)
+        : value && typeof value === "object"
+          ? Object.entries(value)
+              .filter(([, enabled]) => enabled !== false)
+              .map(([key]) => key)
+          : [];
+    const normalized = [];
+    const seen = new Set();
+    for (const entry of source) {
+      const bucket = normalizeCardBucketValue(entry);
+      if (!bucket || seen.has(bucket)) continue;
+      seen.add(bucket);
+      normalized.push(bucket);
+    }
+    if (normalized.length) return normalized;
+    const fallbackSource =
+      Array.isArray(fallback) || fallback instanceof Set
+        ? Array.from(fallback)
+        : CARD_BUCKET_KEYS;
+    const fallbackNormalized = [];
+    const fallbackSeen = new Set();
+    for (const entry of fallbackSource) {
+      const bucket = normalizeCardBucketValue(entry);
+      if (!bucket || fallbackSeen.has(bucket)) continue;
+      fallbackSeen.add(bucket);
+      fallbackNormalized.push(bucket);
+    }
+    return fallbackNormalized.length
+      ? fallbackNormalized
+      : CARD_BUCKET_KEYS.slice();
+  };
+
+  const readOptionalCardBucketList = (value) => {
+    if (value == null) return null;
+    const normalized = normalizeAllowedCardBuckets(value, []);
+    return normalized.length ? normalized : [];
+  };
+
   const SETTINGS_PATHS = Object.freeze({
     SOLVER_RATING_RANGE: "solver.ratingRange",
+    SOLVER_ALLOWED_CARD_BUCKETS: "solver.allowedCardBuckets",
     SOLVER_USE_UNASSIGNED: "solver.useUnassigned",
     SOLVER_ONLY_STORAGE: "solver.onlyStorage",
     SOLVER_EXCLUDE_TRADABLE: "solver.excludeTradable",
@@ -21797,6 +21968,7 @@
         ratingMin: 0,
         ratingMax: 99,
       }),
+      allowedCardBuckets: Object.freeze(CARD_BUCKET_KEYS.slice()),
       useUnassigned: true,
       onlyStorage: false,
       excludeTradable: false,
@@ -21995,6 +22167,136 @@
     };
     return {
       defs,
+      controls,
+      setValues,
+      getValues,
+      setDisabled,
+    };
+  };
+
+  const renderCardBucketPicker = ({
+    idPrefix = "ea-data-card-bucket-",
+    disabled = false,
+  } = {}) => `
+    <div class="ea-data-card-bucket-picker" data-card-bucket-group>
+      <div class="ea-data-card-bucket-picker__grid">
+        ${CARD_BUCKETS.map((bucket) => {
+          const id = `${idPrefix}${bucket.key}`;
+          return `
+            <label class="ea-data-card-bucket" data-bucket="${bucket.key}" data-quality="${bucket.quality}" for="${id}">
+              <input
+                id="${id}"
+                type="checkbox"
+                value="${bucket.key}"
+                data-card-bucket="${bucket.key}"
+                ${disabled ? "disabled" : ""}
+              />
+              <span class="ea-data-card-bucket__swatch" aria-hidden="true"></span>
+              <span class="ea-data-card-bucket__copy">
+                <span class="ea-data-card-bucket__title">${escapeHtml(bucket.label)}</span>
+                <span class="ea-data-card-bucket__meta">${escapeHtml(bucket.rarity)}</span>
+              </span>
+            </label>
+          `;
+        }).join("")}
+      </div>
+      <div class="ea-data-card-bucket-picker__warning" aria-live="polite"></div>
+    </div>
+  `;
+
+  const createCardBucketPickerBinder = ({
+    root = null,
+    idPrefix = "ea-data-card-bucket-",
+    onChange = null,
+  } = {}) => {
+    const controls = CARD_BUCKETS.map((bucket) => ({
+      bucket,
+      input:
+        root?.querySelector?.(`#${idPrefix}${bucket.key}`) ??
+        root?.querySelector?.(`[data-card-bucket="${bucket.key}"]`) ??
+        null,
+    }));
+    const warningEl = root?.querySelector?.(
+      ".ea-data-card-bucket-picker__warning",
+    );
+    let warningTimer = null;
+    const setWarning = (message = "") => {
+      if (!warningEl) return;
+      try {
+        warningEl.textContent = message;
+        warningEl.setAttribute("data-visible", message ? "true" : "false");
+      } catch {}
+      if (warningTimer) {
+        try {
+          clearTimeout(warningTimer);
+        } catch {}
+      }
+      if (message) {
+        warningTimer = setTimeout(() => setWarning(""), 2200);
+      }
+    };
+    const readSnapshot = () => {
+      const selected = [];
+      for (const { bucket, input } of controls) {
+        if (!bucket || !input?.checked) continue;
+        selected.push(bucket.key);
+      }
+      return normalizeAllowedCardBuckets(selected, CARD_BUCKET_KEYS);
+    };
+    const setValues = (settings, fallback = null) => {
+      const fallbackBuckets =
+        fallback && typeof fallback === "object"
+          ? fallback.allowedCardBuckets
+          : CARD_BUCKET_KEYS;
+      const selected = normalizeAllowedCardBuckets(
+        settings?.allowedCardBuckets,
+        fallbackBuckets,
+      );
+      const selectedSet = new Set(selected);
+      for (const { bucket, input } of controls) {
+        if (!bucket || !input) continue;
+        try {
+          input.checked = selectedSet.has(bucket.key);
+        } catch {}
+      }
+      setWarning("");
+      return { allowedCardBuckets: selected };
+    };
+    const getValues = (fallback = null) => {
+      const selected = readSnapshot();
+      return {
+        allowedCardBuckets: normalizeAllowedCardBuckets(
+          selected,
+          fallback?.allowedCardBuckets ?? CARD_BUCKET_KEYS,
+        ),
+      };
+    };
+    const setDisabled = (disabled) => {
+      const nextDisabled = Boolean(disabled);
+      for (const { input } of controls) {
+        if (!input) continue;
+        try {
+          input.disabled = nextDisabled;
+        } catch {}
+      }
+    };
+    for (const { input } of controls) {
+      input?.addEventListener?.("change", () => {
+        const checkedInputs = controls.filter((entry) => entry.input?.checked);
+        if (!checkedInputs.length) {
+          try {
+            input.checked = true;
+          } catch {}
+          setWarning("Keep at least one card type enabled.");
+          return;
+        }
+        setWarning("");
+        if (typeof onChange === "function") {
+          onChange(getValues());
+        }
+      });
+    }
+    return {
       controls,
       setValues,
       getValues,
@@ -22264,6 +22566,13 @@
     const normalized = {};
     const solver = {};
     if (ratingRange) solver.ratingRange = ratingRange;
+    const allowedCardBuckets = readOptionalCardBucketList(
+      solverRaw?.allowedCardBuckets ??
+        (legacyRange ? scope?.allowedCardBuckets : null),
+    );
+    if (allowedCardBuckets != null) {
+      solver.allowedCardBuckets = allowedCardBuckets;
+    }
     for (const field of SOLVER_TOGGLE_FIELDS) {
       const solverValue = getSolverToggleRawValue(solverRaw, field);
       const legacyValue = legacyRange
@@ -22318,6 +22627,12 @@
     if (path === SETTINGS_PATHS.SOLVER_RATING_RANGE) {
       return normalizeRatingRange(SETTINGS_DEFAULTS.solver.ratingRange);
     }
+    if (path === SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS) {
+      return normalizeAllowedCardBuckets(
+        SETTINGS_DEFAULTS.solver.allowedCardBuckets,
+        CARD_BUCKET_KEYS,
+      );
+    }
     const toggleField = getSolverToggleFieldByPath(path);
     if (toggleField) {
       return Boolean(SETTINGS_DEFAULTS?.solver?.[toggleField.key]);
@@ -22363,6 +22678,12 @@
   const normalizeSettingValueForPath = (path, value) => {
     if (path === SETTINGS_PATHS.SOLVER_RATING_RANGE) {
       return normalizeRatingRange(value);
+    }
+    if (path === SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS) {
+      return normalizeAllowedCardBuckets(
+        value,
+        getSettingDefault(SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS),
+      );
     }
     const toggleField = getSolverToggleFieldByPath(path);
     if (toggleField) {
@@ -22426,6 +22747,7 @@
     });
     const globalDefaults = [
       SETTINGS_PATHS.SOLVER_RATING_RANGE,
+      SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS,
       ...SOLVER_TOGGLE_FIELDS.map((field) => field.path),
       SETTINGS_PATHS.SOLVER_EXCLUDED_PLAYER_IDS,
       SETTINGS_PATHS.SOLVER_EXCLUDED_LEAGUE_IDS,
@@ -22638,6 +22960,9 @@
 
   const getDefaultSolverSettings = () => ({
     ratingRange: getSettingDefault(SETTINGS_PATHS.SOLVER_RATING_RANGE),
+    allowedCardBuckets: getSettingDefault(
+      SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS,
+    ),
     ...getDefaultSolverPoolSettings(),
     excludedPlayerIds: getSettingDefault(
       SETTINGS_PATHS.SOLVER_EXCLUDED_PLAYER_IDS,
@@ -22667,6 +22992,11 @@
       getDefaultSolverPoolSettings(),
     );
     const normalizedPool = normalizeSolverPoolSettingsInput(raw, fallbackPool);
+    const allowedCardBuckets = normalizeAllowedCardBuckets(
+      raw?.allowedCardBuckets,
+      fallbackSettings?.allowedCardBuckets ??
+        getSettingDefault(SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS),
+    );
     const fallbackExcludedPlayerIds = normalizePlayerIdList(
       fallbackSettings?.excludedPlayerIds,
       getSettingDefault(SETTINGS_PATHS.SOLVER_EXCLUDED_PLAYER_IDS),
@@ -22701,6 +23031,7 @@
     );
     return {
       ratingRange: normalizeRatingRange(ratingRangeRaw ?? fallbackRange),
+      allowedCardBuckets,
       ...normalizedPool,
       excludedPlayerIds,
       excludedLeagueIds,
@@ -22724,6 +23055,12 @@
         sessionScope,
         path: SETTINGS_PATHS.SOLVER_RATING_RANGE,
         fallback: defaults.ratingRange,
+      }),
+      allowedCardBuckets: resolveEffectiveSettingFromPreferences(prefs, {
+        challengeId,
+        sessionScope,
+        path: SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS,
+        fallback: defaults.allowedCardBuckets,
       }),
     };
     for (const field of SOLVER_TOGGLE_FIELDS) {
@@ -22802,6 +23139,11 @@
       SETTINGS_PATHS.SOLVER_RATING_RANGE,
       normalized.ratingRange,
     );
+    setSettingByPathMut(
+      next.global,
+      SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS,
+      normalized.allowedCardBuckets,
+    );
     for (const field of SOLVER_TOGGLE_FIELDS) {
       setSettingByPathMut(next.global, field.path, normalized[field.key]);
     }
@@ -22844,6 +23186,11 @@
       scope,
       SETTINGS_PATHS.SOLVER_RATING_RANGE,
       normalized.ratingRange,
+    );
+    setSettingByPathMut(
+      scope,
+      SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS,
+      normalized.allowedCardBuckets,
     );
     for (const field of SOLVER_TOGGLE_FIELDS) {
       setSettingByPathMut(scope, field.path, normalized[field.key]);
@@ -23580,6 +23927,28 @@
   const isTotwOrTotsPlayer = (player) =>
     isTotwPlayer(player) || isTotsPlayer(player);
 
+  const getPlayerQualityBucket = (player) => {
+    const rating = readNumeric(player?.rating) ?? 0;
+    if (rating >= 75) return "gold";
+    if (rating >= 65) return "silver";
+    return "bronze";
+  };
+
+  const isRareBasePlayer = (player) => {
+    const rarityName = String(player?.rarityName ?? "")
+      .trim()
+      .toLowerCase();
+    if (rarityName.includes("rare")) return true;
+    const rarityId = readNumeric(player?.rarityId);
+    return rarityId != null ? rarityId >= 1 : false;
+  };
+
+  const getBaseCardBucket = (player) => {
+    if (!player || Boolean(player?.isSpecial)) return null;
+    const quality = getPlayerQualityBucket(player);
+    return `${isRareBasePlayer(player) ? "rare" : "common"}_${quality}`;
+  };
+
   const filterPlayersBySolverPoolSettings = (
     players,
     settings,
@@ -23599,6 +23968,11 @@
     const excludeSpecial = Boolean(poolSettings?.excludeSpecial);
     const useTotwPlayers = Boolean(poolSettings?.useTotwPlayers);
     const useEvolutionPlayers = Boolean(poolSettings?.useEvolutionPlayers);
+    const allowedCardBuckets = normalizeAllowedCardBuckets(
+      normalized?.allowedCardBuckets,
+      getSettingDefault(SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS),
+    );
+    const allowedCardBucketSet = new Set(allowedCardBuckets);
     const excludedPlayerIds = normalizePlayerIdList(
       normalized?.excludedPlayerIds,
       getSettingDefault(SETTINGS_PATHS.SOLVER_EXCLUDED_PLAYER_IDS),
@@ -23654,12 +24028,15 @@
       const isTotwOrTots = isTotwOrTotsPlayer(player);
       if (!useTotwPlayers && isTotwOrTots) return false;
       if (useUnassigned && (player?.isDuplicate || player?.isUnassigned)) {
-        return true;
+        const bucket = getBaseCardBucket(player);
+        return !bucket || allowedCardBucketSet.has(bucket);
       }
       if (onlyStorage && !isOnlyStorageEligible(player)) return false;
       if (excludeTradable && Boolean(player?.isTradeable)) return false;
       if (excludeSpecial && Boolean(player?.isSpecial) && !isTotwOrTots)
         return false;
+      const bucket = getBaseCardBucket(player);
+      if (bucket && !allowedCardBucketSet.has(bucket)) return false;
       const rating = readNumeric(player?.rating);
       return rating != null && rating >= ratingMin && rating <= ratingMax;
     });
@@ -23669,6 +24046,7 @@
       poolFilters: {
         ratingMin,
         ratingMax,
+        allowedCardBuckets,
         ...poolSettings,
         excludedPlayerIds,
         excludedLeagueIds,
