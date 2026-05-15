@@ -5291,11 +5291,19 @@
     };
   };
 
-  const buildChallengeSlotsForSolver = (challenge, loadedData) => {
+  const buildChallengeSlotsForSolver = (
+    challenge,
+    loadedData,
+    { preferLoaded = false } = {},
+  ) => {
     const squad =
+      (preferLoaded
+        ? (loadedData?.data?.squad ?? loadedData?.squad ?? null)
+        : null) ??
       challenge?.squad ??
-      loadedData?.data?.squad ??
-      loadedData?.squad ??
+      (preferLoaded
+        ? null
+        : (loadedData?.data?.squad ?? loadedData?.squad ?? null)) ??
       (typeof challenge?.getSquad === "function" ? challenge.getSquad() : null);
     if (!squad) {
       return {
@@ -5400,6 +5408,30 @@
     return Boolean(slotInfo?.formationName);
   };
 
+  const isSuspiciousChallengeSlotInfo = (slotInfo) => {
+    if (!slotInfo || typeof slotInfo !== "object") return false;
+    const squadSlots = Array.isArray(slotInfo?.squadSlots)
+      ? slotInfo.squadSlots
+      : [];
+    const slotCount = readNumeric(slotInfo?.slotCount);
+    const requiredPlayers = readNumeric(slotInfo?.requiredPlayers);
+    const expectedFieldSlots =
+      requiredPlayers != null && Number(requiredPlayers) > 0
+        ? Number(requiredPlayers)
+        : squadSlots.length || 11;
+    if (squadSlots.length > 0 && squadSlots.length < expectedFieldSlots) {
+      return true;
+    }
+    if (
+      slotCount != null &&
+      expectedFieldSlots > 0 &&
+      Number(slotCount) > expectedFieldSlots + 4
+    ) {
+      return true;
+    }
+    return false;
+  };
+
   const resolveChallengeSlotsSnapshot = async (
     challenge,
     { source = "unknown", forceLoadWhenMissing = true, logResult = false } = {},
@@ -5408,12 +5440,17 @@
     let slotInfo = buildChallengeSlotsForSolver(challenge, null);
     let slotSource = "local";
     if (
-      !hasUsableChallengeSlotInfo(slotInfo) &&
+      (!hasUsableChallengeSlotInfo(slotInfo) ||
+        isSuspiciousChallengeSlotInfo(slotInfo)) &&
       challenge &&
       forceLoadWhenMissing
     ) {
       loaded = await loadChallenge(challenge, true, { force: true });
-      slotInfo = buildChallengeSlotsForSolver(challenge, loaded?.data ?? loaded);
+      slotInfo = buildChallengeSlotsForSolver(
+        challenge,
+        loaded?.data ?? loaded,
+        { preferLoaded: true },
+      );
       slotSource = "loaded";
     }
     if (logResult) {
@@ -5426,6 +5463,9 @@
         squadSlots: Array.isArray(slotInfo?.squadSlots)
           ? slotInfo.squadSlots.length
           : 0,
+        slotPositions: Array.isArray(slotInfo?.squadSlots)
+          ? slotInfo.squadSlots.map((slot) => slot?.positionName ?? null)
+          : [],
         requiredPlayers: slotInfo?.requiredPlayers ?? null,
         formationName: slotInfo?.formationName ?? null,
       });
@@ -13913,6 +13953,7 @@
             const slotInfo = buildChallengeSlotsForSolver(
               challenge,
               loaded?.data ?? loaded,
+              { preferLoaded: true },
             );
             const safeRequirements = (snapshot?.requirements ?? []).map(
               serializeRequirementForSolver,
@@ -14175,6 +14216,7 @@
             const slotInfo = buildChallengeSlotsForSolver(
               challenge,
               loaded?.data ?? loaded,
+              { preferLoaded: true },
             );
             const safeRequirements = (snapshot?.requirements ?? []).map(
               serializeRequirementForSolver,
@@ -14786,6 +14828,7 @@
                   const reSolveSlotInfo = buildChallengeSlotsForSolver(
                     challengeEntity,
                     reSolveLoaded?.data ?? reSolveLoaded,
+                    { preferLoaded: true },
                   );
                   const reSolveReqs = (reSolveSnapshot?.requirements ?? []).map(
                     serializeRequirementForSolver,
@@ -18884,6 +18927,7 @@
         slotInfo = buildChallengeSlotsForSolver(
           challengeEntity,
           loaded?.data ?? loaded,
+          { preferLoaded: true },
         );
         hasUsableSlots =
           Array.isArray(slotInfo?.squadSlots) && slotInfo.squadSlots.length > 0;
