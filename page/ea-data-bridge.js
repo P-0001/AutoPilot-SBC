@@ -882,6 +882,15 @@
     return null;
   };
 
+  const getPlayerQualityLabel = (player) => {
+    if (player?.isSpecial) return "Special";
+    const quality = getPlayerQualityBucket(player);
+    if (quality === "gold") return "Gold";
+    if (quality === "silver") return "Silver";
+    if (quality === "bronze") return "Bronze";
+    return "";
+  };
+
   const buildPreviewRows = ({
     solutionIds = [],
     slotSolution = null,
@@ -928,6 +937,7 @@
           ? String(nameRaw).trim()
           : "Unknown";
       const rarity = player?.rarityName ?? "";
+      const qualityLabel = getPlayerQualityLabel(player);
       const definitionId = player?.definitionId ?? null;
       const priceLookupId = definitionId ?? playerId;
       rows.push({
@@ -939,6 +949,7 @@
         ratingNum: ratingNum == null ? -1 : ratingNum,
         name,
         rarity,
+        qualityLabel,
         definitionId,
         priceLookupId,
         isSpecial: Boolean(player?.isSpecial),
@@ -973,12 +984,7 @@
     }
     const rowMarkup = normalizedRows
       .map((row, index) => {
-        const idText =
-          row?.definitionId != null
-            ? `def ${row.definitionId}`
-            : row?.playerId != null
-              ? `id ${row.playerId}`
-              : "";
+        const qualityText = row?.qualityLabel ?? "";
         const statusPills = [];
         if (row?.isSpecial) {
           statusPills.push(
@@ -1028,8 +1034,8 @@
               </div>
               <div class="ea-data-preview-right">
                 ${
-                  idText
-                    ? `<div class="ea-data-preview-id">${escapeHtml(idText)}</div>`
+                  qualityText
+                    ? `<div class="ea-data-preview-id">${escapeHtml(qualityText)}</div>`
                     : ""
                 }
                 ${statusPills.join("")}
@@ -5046,6 +5052,21 @@
       scopeName: rule.scopeName ?? null,
       label: rule.label ?? null,
     };
+  };
+
+  const buildSafeNormalizedRequirementsForSolver = (
+    requirementsNormalized,
+    requirements,
+  ) => {
+    const normalized = Array.isArray(requirementsNormalized)
+      ? requirementsNormalized
+      : [];
+    const derived = normalized.length
+      ? normalized
+      : normalizeRequirementsToRulesFromList(
+          Array.isArray(requirements) ? requirements : [],
+        );
+    return derived.map(serializeNormalizedRequirementForSolver);
   };
 
   const appendSquadSizeRequirement = (requirements, count) => {
@@ -9920,7 +9941,7 @@
         const rating = data.rating ?? "?";
         const name = data.name ?? "Unknown";
         const rarity = data.rarity ?? "";
-        const definitionId = data.definitionId ?? null;
+        const qualityLabel = data.qualityLabel ?? "";
         const isSpecial = Boolean(data.isSpecial);
         const chemVal = data.chemVal;
         const onPosVal = data.onPosVal;
@@ -9963,12 +9984,7 @@
 
         const idEl = document.createElement("div");
         idEl.className = "ea-data-preview-id";
-        idEl.textContent =
-          definitionId != null
-            ? `def ${definitionId}`
-            : playerId != null
-              ? `id ${playerId}`
-              : "";
+        idEl.textContent = qualityLabel;
         if (idEl.textContent) right.append(idEl);
 
         if (isSpecial) {
@@ -12358,12 +12374,7 @@
 
             const idEl = document.createElement("div");
             idEl.className = "ea-data-preview-id";
-            idEl.textContent =
-              rowData.definitionId != null
-                ? `def ${rowData.definitionId}`
-                : rowData.playerId != null
-                  ? `id ${rowData.playerId}`
-                  : "";
+            idEl.textContent = rowData.qualityLabel ?? "";
             if (idEl.textContent) right.append(idEl);
 
             if (rowData.isSpecial) {
@@ -12816,6 +12827,7 @@
               ? String(nameRaw).trim()
               : "Unknown";
           const rarity = player?.rarityName ?? "";
+          const qualityLabel = getPlayerQualityLabel(player);
           const definitionId = player?.definitionId ?? null;
           const isSpecial = Boolean(player?.isSpecial);
           const chemVal = perChem?.[i];
@@ -12831,6 +12843,7 @@
             ratingNum: ratingNum == null ? -1 : ratingNum,
             name,
             rarity,
+            qualityLabel,
             definitionId,
             priceLookupId,
             isSpecial,
@@ -12892,12 +12905,7 @@
 
           const idEl = document.createElement("div");
           idEl.className = "ea-data-preview-id";
-          idEl.textContent =
-            rowData.definitionId != null
-              ? `def ${rowData.definitionId}`
-              : rowData.playerId != null
-                ? `id ${rowData.playerId}`
-                : "";
+          idEl.textContent = rowData.qualityLabel ?? "";
           if (idEl.textContent) right.append(idEl);
 
           if (rowData.isSpecial) {
@@ -18715,6 +18723,49 @@
       }
 
       let hydratedChallenge = challengeEntity;
+      const refreshSubmissionChallengeState = () => {
+        try {
+          hydratedChallenge?.onDataChange?.notify?.({
+            squad: hydratedChallenge?.squad ?? null,
+          });
+        } catch {}
+      };
+      const getSubmissionSquadDiagnostics = () => {
+        const squad = hydratedChallenge?.squad ?? null;
+        const slots = Array.isArray(squad?.getPlayers?.())
+          ? squad.getPlayers()
+          : [];
+        let validCount = 0;
+        let realItemCount = 0;
+        let conceptCount = 0;
+        for (let index = 0; index < slots.length; index += 1) {
+          const slot = squad?.getSlot?.(index) ?? slots[index];
+          const item = resolveSlotItem(slot);
+          if (experimentIsRealItem(item ?? slot ?? null)) realItemCount += 1;
+          const concept =
+            typeof item?.isConcept === "function"
+              ? item.isConcept()
+              : Boolean(item?.concept);
+          if (concept) conceptCount += 1;
+          if (resolveSlotValid(slot, item)) validCount += 1;
+        }
+        const requiredPlayers =
+          typeof squad?.getNumOfRequiredPlayers === "function"
+            ? squad.getNumOfRequiredPlayers()
+            : null;
+        return {
+          challengeId: hydratedChallenge?.id ?? null,
+          challengeName,
+          solutionCount: solutionIds.length,
+          requiredPlayers,
+          slotCount: slots.length,
+          validCount,
+          realItemCount,
+          conceptCount,
+          status: hydratedChallenge?.status ?? null,
+          isCompleted: Boolean(hydratedChallenge?.isCompleted?.()),
+        };
+      };
       if (!hydratedChallenge?.squad || !useStoredChallenge) {
         notifyPhase("loading", `Loading ${challengeName}...`);
         try {
@@ -18783,7 +18834,13 @@
           preserveExistingValid: false,
           preHydratedChallenge: Boolean(hydratedChallenge?.squad),
         });
-        await delayMs(jitterMs(350, 0.35));
+        refreshSubmissionChallengeState();
+        await delayMs(jitterMs(650, 0.35));
+        log(
+          "debug",
+          "[EA Data] Sequence submit squad diagnostics",
+          getSubmissionSquadDiagnostics(),
+        );
       } catch (error) {
         const message =
           sanitizeDisplayText(error?.message) ??
@@ -18809,6 +18866,38 @@
       let submitResult = null;
       try {
         submitResult = await submitSbcChallenge(hydratedChallenge);
+        log("debug", "[EA Data] Sequence submit result", {
+          ...getSubmissionSquadDiagnostics(),
+          success: Boolean(submitResult?.success),
+          status: submitResult?.status ?? null,
+          error: submitResult?.error ?? null,
+        });
+        const statusNum =
+          parseStatusNumber(submitResult?.status) ??
+          parseStatusNumber(submitResult?.error);
+        if (!submitResult?.success && statusNum === 403) {
+          notifyPhase("refreshing", `Refreshing ${challengeName}...`);
+          await delayMs(jitterMs(900, 0.25));
+          try {
+            const loaded = await loadChallenge(hydratedChallenge, true, {
+              force: true,
+            });
+            if (loaded?.data?.squad) {
+              try {
+                hydratedChallenge.squad = loaded.data.squad;
+              } catch {}
+            }
+          } catch {}
+          refreshSubmissionChallengeState();
+          notifyPhase("submitting", `Submitting ${challengeName}...`);
+          submitResult = await submitSbcChallenge(hydratedChallenge);
+          log("debug", "[EA Data] Sequence submit retry result", {
+            ...getSubmissionSquadDiagnostics(),
+            success: Boolean(submitResult?.success),
+            status: submitResult?.status ?? null,
+            error: submitResult?.error ?? null,
+          });
+        }
       } catch (error) {
         const message =
           sanitizeDisplayText(error?.message) ??
@@ -19051,9 +19140,10 @@
       const safeRequirements = (snapshot?.requirements ?? []).map(
         serializeRequirementForSolver,
       );
-      const safeRequirementsNormalized = (
-        snapshot?.requirementsNormalized ?? []
-      ).map(serializeNormalizedRequirementForSolver);
+      const safeRequirementsNormalized = buildSafeNormalizedRequirementsForSolver(
+        snapshot?.requirementsNormalized ?? [],
+        safeRequirements,
+      );
 
       const poolConflict = buildSolverPoolExclusionConflict({
         settings: step?.settingsSnapshot,
@@ -19180,6 +19270,35 @@
             source: "solver",
             reason: "Solver returned an empty squad.",
             phase: "solving",
+          }),
+        };
+      }
+
+      const cardTypeValidationFailure =
+        buildSolvedSquadCardTypeValidationFailure({
+          solutionIds,
+          playerById: runContext?.playerById,
+          requirementsNormalized: safeRequirementsNormalized,
+        });
+      if (cardTypeValidationFailure) {
+        const reason =
+          cardTypeValidationFailure.reason ??
+          "Solved squad does not satisfy card type requirements.";
+        markRunProgressPhase(
+          sequenceSolveOverlayState?.runState,
+          progressAttemptKey,
+          "skipped",
+        );
+        return {
+          status: "skipped",
+          code: "NO_SOLUTION",
+          message: reason,
+          failureContext: buildFailureContext({
+            source: "solver",
+            reason,
+            phase: "solving",
+            failingRequirements:
+              cardTypeValidationFailure.failingRequirements ?? [],
           }),
         };
       }
@@ -24282,6 +24401,160 @@
     return Array.from(ids);
   };
 
+  const CARD_TYPE_CONFLICT_QUALITY_RANK = Object.freeze({
+    bronze: 1,
+    silver: 2,
+    gold: 3,
+  });
+  const CARD_TYPE_CONFLICT_QUALITIES = Object.freeze([
+    "bronze",
+    "silver",
+    "gold",
+  ]);
+
+  const normalizeCardTypeConflictQuality = (value) => {
+    if (value == null) return null;
+    const text = String(value).trim().toLowerCase();
+    if (text.includes("bronze")) return "bronze";
+    if (text.includes("silver")) return "silver";
+    if (text.includes("gold")) return "gold";
+    const numeric = readNumeric(value);
+    if (numeric != null) {
+      if (numeric <= 1) return "bronze";
+      if (numeric === 2) return "silver";
+      if (numeric >= 3) return "gold";
+    }
+    return null;
+  };
+
+  const getNormalizedRuleValues = (rule) => {
+    const values = [];
+    const pushValue = (value) => {
+      if (Array.isArray(value)) {
+        for (const item of value) pushValue(item);
+        return;
+      }
+      if (value == null) return;
+      values.push(value);
+    };
+    pushValue(rule?.value);
+    pushValue(rule?.values);
+    return values;
+  };
+
+  const deriveQualityValuesFromRule = (rule) => {
+    const values = getNormalizedRuleValues(rule)
+      .map(normalizeCardTypeConflictQuality)
+      .filter(Boolean);
+    if (values.length) return values;
+    const label = String(rule?.label ?? "").trim().toLowerCase();
+    return CARD_TYPE_CONFLICT_QUALITIES.filter((quality) =>
+      label.includes(quality),
+    );
+  };
+
+  const deriveRarityValuesFromRule = (rule) => {
+    const values = getNormalizedRuleValues(rule)
+      .map((value) => String(value ?? "").trim().toLowerCase())
+      .filter(Boolean);
+    const label = String(rule?.label ?? "").trim().toLowerCase();
+    const source = `${values.join(" ")} ${label}`;
+    const rarities = [];
+    if (source.includes("common")) rarities.push("common");
+    if (source.includes("rare")) rarities.push("rare");
+    return rarities;
+  };
+
+  const getRequiredSquadSizeFromRules = (requirementsNormalized) => {
+    const rules = Array.isArray(requirementsNormalized)
+      ? requirementsNormalized
+      : [];
+    for (const rule of rules) {
+      const type = normalizeKeyName(
+        rule?.type ?? rule?.keyNameNormalized ?? rule?.keyName ?? null,
+      );
+      if (type !== "players_in_squad") continue;
+      const count =
+        readNumeric(rule?.derivedCount) ??
+        readNumeric(rule?.count) ??
+        readNumeric(rule?.value);
+      if (count != null && count > 0) return count;
+    }
+    return null;
+  };
+
+  const isAllSquadCardTypeRequirement = (rule, requiredPlayers) => {
+    const target =
+      readNumeric(rule?.derivedCount) ??
+      readNumeric(rule?.count) ??
+      null;
+    if (target == null || target === -1) return true;
+    if (requiredPlayers == null) return false;
+    return target >= requiredPlayers;
+  };
+
+  const getCardTypeRequirementCount = (rule) =>
+    readNumeric(rule?.derivedCount) ?? readNumeric(rule?.count) ?? null;
+
+  const shouldCheckPartialCardTypeRequirement = (rule) => {
+    const op = String(rule?.op ?? "").trim().toLowerCase();
+    const target = getCardTypeRequirementCount(rule);
+    const hasPositiveTarget = target == null || target === -1 || target > 0;
+    if (!hasPositiveTarget) return false;
+    return op === "exact" || op === "min";
+  };
+
+  const isPlayerLevelQuotaRule = (rule) => {
+    const type = normalizeKeyName(
+      rule?.type ?? rule?.keyNameNormalized ?? rule?.keyName ?? null,
+    );
+    if (type !== "player_level") return false;
+    const label = String(rule?.label ?? "").trim().toLowerCase();
+    if (!label) return false;
+    if (label.includes("player level") || label.includes("player quality")) {
+      return false;
+    }
+    return (
+      label.includes("bronze") ||
+      label.includes("silver") ||
+      label.includes("gold")
+    );
+  };
+
+  const getAllowedQualitiesForRequirement = (rule) => {
+    const values = deriveQualityValuesFromRule(rule);
+    const ranks = values
+      .map((quality) => CARD_TYPE_CONFLICT_QUALITY_RANK[quality])
+      .filter((rank) => rank != null);
+    if (!ranks.length) return [];
+    const op = String(rule?.op ?? "").trim().toLowerCase();
+    if (op === "max") {
+      const threshold = Math.min(...ranks);
+      return CARD_TYPE_CONFLICT_QUALITIES.filter(
+        (quality) => CARD_TYPE_CONFLICT_QUALITY_RANK[quality] <= threshold,
+      );
+    }
+    if (op === "min") {
+      const threshold = Math.max(...ranks);
+      return CARD_TYPE_CONFLICT_QUALITIES.filter(
+        (quality) => CARD_TYPE_CONFLICT_QUALITY_RANK[quality] >= threshold,
+      );
+    }
+    return values;
+  };
+
+  const formatCardTypeConflictLabel = (values) =>
+    formatConflictValueList(
+      (Array.isArray(values) ? values : []).map((value) => {
+        if (value === "bronze") return "Bronze";
+        if (value === "silver") return "Silver";
+        if (value === "gold") return "Gold";
+        if (value === "common") return "Common";
+        if (value === "rare") return "Rare";
+        return value;
+      }),
+    );
+
   const buildSolverPoolExclusionConflict = ({
     settings,
     requirementsNormalized = [],
@@ -24303,17 +24576,80 @@
     const excludedPlayerIdSet = new Set(excludedPlayerIds.map(String));
     const excludedLeagueIdSet = new Set(excludedLeagueIds.map(String));
     const excludedNationIdSet = new Set(excludedNationIds.map(String));
-    if (
-      !excludedPlayerIdSet.size &&
-      !excludedLeagueIdSet.size &&
-      !excludedNationIdSet.size
-    ) {
-      return {
-        hasConflict: false,
-        conflictingLockedPlayerIds: [],
-        conflictingLeagueIds: [],
-        conflictingNationIds: [],
-      };
+    const allowedCardBuckets = normalizeAllowedCardBuckets(
+      normalized?.allowedCardBuckets,
+      getSettingDefault(SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS),
+    );
+    const selectedQualities = new Set();
+    const selectedRarities = new Set();
+    for (const bucket of allowedCardBuckets) {
+      const [rarity, quality] = String(bucket ?? "").split("_");
+      if (rarity) selectedRarities.add(rarity);
+      if (quality) selectedQualities.add(quality);
+    }
+    const requiredPlayers = getRequiredSquadSizeFromRules(
+      requirementsNormalized,
+    );
+    const conflictingCardTypeRequirements = [];
+    const rules = Array.isArray(requirementsNormalized)
+      ? requirementsNormalized
+      : [];
+    for (const rule of rules) {
+      const type = normalizeKeyName(
+        rule?.type ?? rule?.keyNameNormalized ?? rule?.keyName ?? null,
+      );
+      if (
+        type !== "player_quality" &&
+        type !== "player_level" &&
+        type !== "player_rarity" &&
+        type !== "player_rarity_group"
+      ) {
+        continue;
+      }
+      const isAllSquadRule = isAllSquadCardTypeRequirement(
+        rule,
+        requiredPlayers,
+      );
+      const shouldCheckPartialRule =
+        shouldCheckPartialCardTypeRequirement(rule);
+      const shouldCheckRule = isAllSquadRule || shouldCheckPartialRule;
+      if (!shouldCheckRule) continue;
+      if (type === "player_quality" || type === "player_level") {
+        const allowedQualities =
+          type === "player_level" && isPlayerLevelQuotaRule(rule)
+            ? deriveQualityValuesFromRule(rule)
+            : getAllowedQualitiesForRequirement(rule);
+        if (!allowedQualities.length) continue;
+        const hasOverlap = allowedQualities.some((quality) =>
+          selectedQualities.has(quality),
+        );
+        if (!hasOverlap) {
+          conflictingCardTypeRequirements.push({
+            kind: "quality",
+            label: rule?.label ?? null,
+            required: allowedQualities,
+            selected: Array.from(selectedQualities),
+            count: getCardTypeRequirementCount(rule),
+            op: rule?.op ?? null,
+          });
+        }
+        continue;
+      }
+      const allowedRarities = deriveRarityValuesFromRule(rule);
+      if (!allowedRarities.length) continue;
+      const hasOverlap = allowedRarities.some((rarity) =>
+        selectedRarities.has(rarity),
+      );
+      if (!hasOverlap) {
+        conflictingCardTypeRequirements.push({
+          kind: "rarity",
+          label: rule?.label ?? null,
+          required: allowedRarities,
+          selected: Array.from(selectedRarities),
+          count: getCardTypeRequirementCount(rule),
+          op: rule?.op ?? null,
+        });
+      }
     }
 
     const requiredLeagueIds = collectExplicitRequiredLeagueIds(
@@ -24337,10 +24673,12 @@
       hasConflict:
         conflictingLockedPlayerIds.length > 0 ||
         conflictingLeagueIds.length > 0 ||
-        conflictingNationIds.length > 0,
+        conflictingNationIds.length > 0 ||
+        conflictingCardTypeRequirements.length > 0,
       conflictingLockedPlayerIds,
       conflictingLeagueIds,
       conflictingNationIds,
+      conflictingCardTypeRequirements,
     };
   };
 
@@ -24382,6 +24720,11 @@
     const conflictingPlayerLabels = (
       conflict?.conflictingLockedPlayerIds ?? []
     ).map((itemId) => getExcludedPlayerLabelById(itemId) ?? `Player ${itemId}`);
+    const cardTypeConflicts = Array.isArray(
+      conflict?.conflictingCardTypeRequirements,
+    )
+      ? conflict.conflictingCardTypeRequirements
+      : [];
     const leagueText = formatConflictValueList(conflictingLeagueLabels);
     const nationText = formatConflictValueList(conflictingNationLabels);
     const playerText = formatConflictValueList(conflictingPlayerLabels);
@@ -24404,10 +24747,138 @@
       messageParts.push(`a locked squad player is excluded (${playerText})`);
       reasonParts.push("Locked squad player is excluded");
     }
+    for (const entry of cardTypeConflicts) {
+      const selectedText = formatCardTypeConflictLabel(entry?.selected);
+      const requiredText = formatCardTypeConflictLabel(entry?.required);
+      if (!selectedText || !requiredText) continue;
+      messageParts.push(
+        `selected card types (${selectedText}) cannot satisfy required ${entry?.kind ?? "card"} (${requiredText})`,
+      );
+      reasonParts.push("Selected card types conflict with challenge requirements");
+    }
     return {
       title: "Pool Exclusion Conflict",
       message: `${challengePrefix}${messageParts.join("; ")}.`,
       reason: `${reasonParts.join("; ")}.`,
+    };
+  };
+
+  const buildCardTypeRulePredicate = (rule) => {
+    const type = normalizeKeyName(
+      rule?.type ?? rule?.keyNameNormalized ?? rule?.keyName ?? null,
+    );
+    if (type === "player_quality" || type === "player_level") {
+      const qualities = deriveQualityValuesFromRule(rule);
+      if (!qualities.length) return null;
+      if (type === "player_level" && isPlayerLevelQuotaRule(rule)) {
+        const allowed = new Set(qualities);
+        return (player) => allowed.has(getPlayerQualityBucket(player));
+      }
+      const ranks = qualities
+        .map((quality) => CARD_TYPE_CONFLICT_QUALITY_RANK[quality])
+        .filter((rank) => rank != null);
+      if (!ranks.length) return null;
+      const op = String(rule?.op ?? "").trim().toLowerCase();
+      if (op === "max") {
+        const threshold = Math.min(...ranks);
+        return (player) =>
+          (CARD_TYPE_CONFLICT_QUALITY_RANK[getPlayerQualityBucket(player)] ??
+            0) <= threshold;
+      }
+      if (op === "min") {
+        const threshold = Math.max(...ranks);
+        return (player) =>
+          (CARD_TYPE_CONFLICT_QUALITY_RANK[getPlayerQualityBucket(player)] ??
+            0) >= threshold;
+      }
+      const allowed = new Set(qualities);
+      return (player) => allowed.has(getPlayerQualityBucket(player));
+    }
+
+    if (type === "player_rarity" || type === "player_rarity_group") {
+      const rarities = deriveRarityValuesFromRule(rule);
+      if (!rarities.length) return null;
+      const allowed = new Set(rarities);
+      return (player) =>
+        allowed.has(isRareBasePlayer(player) ? "rare" : "common");
+    }
+
+    return null;
+  };
+
+  const buildSolvedSquadCardTypeValidationFailure = ({
+    solutionIds,
+    playerById,
+    requirementsNormalized,
+  } = {}) => {
+    const ids = Array.isArray(solutionIds) ? solutionIds : [];
+    const players = ids
+      .map((id) => playerById?.get?.(String(id)) ?? null)
+      .filter(Boolean);
+    if (!players.length) return null;
+    const rules = Array.isArray(requirementsNormalized)
+      ? requirementsNormalized
+      : [];
+    const requiredPlayers = getRequiredSquadSizeFromRules(rules);
+    const failures = [];
+
+    for (const rule of rules) {
+      const type = normalizeKeyName(
+        rule?.type ?? rule?.keyNameNormalized ?? rule?.keyName ?? null,
+      );
+      if (
+        type !== "player_quality" &&
+        type !== "player_level" &&
+        type !== "player_rarity" &&
+        type !== "player_rarity_group"
+      ) {
+        continue;
+      }
+      const predicate = buildCardTypeRulePredicate(rule);
+      if (!predicate) continue;
+      const op = String(rule?.op ?? "").trim().toLowerCase();
+      const required = getCardTypeRequirementCount(rule);
+      const matched = players.reduce(
+        (total, player) => total + (predicate(player) ? 1 : 0),
+        0,
+      );
+      const isAllSquadRule = isAllSquadCardTypeRequirement(
+        rule,
+        requiredPlayers,
+      );
+      let failed = false;
+      if (required == null || required === -1 || isAllSquadRule) {
+        failed = matched < players.length;
+      } else if (op === "max") {
+        failed = matched > required;
+      } else if (op === "exact") {
+        failed = matched !== required;
+      } else {
+        failed = matched < required;
+      }
+      if (!failed) continue;
+      failures.push({
+        label:
+          sanitizeDisplayText(rule?.label) ??
+          `${formatCardTypeConflictLabel(
+            type === "player_rarity" || type === "player_rarity_group"
+              ? deriveRarityValuesFromRule(rule)
+              : deriveQualityValuesFromRule(rule),
+          )} requirement`,
+        matched,
+        required: required == null || required === -1 ? players.length : required,
+        op: op || null,
+      });
+    }
+
+    if (!failures.length) return null;
+    const details = failures
+      .slice(0, 3)
+      .map((entry) => `${entry.label} (${entry.matched}/${entry.required})`)
+      .join("; ");
+    return {
+      reason: `Solved squad does not satisfy card type requirements: ${details}.`,
+      failingRequirements: failures,
     };
   };
 

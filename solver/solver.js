@@ -436,6 +436,20 @@ const buildQualityGatePredicate = (rule) => {
   return null;
 };
 
+const isPlayerLevelQuotaRule = (rule) => {
+  if (!rule || rule.type !== "player_level") return false;
+  const label = normalizeString(rule?.raw?.label || rule?.label);
+  if (!label) return false;
+  if (label.includes("player level") || label.includes("player quality")) {
+    return false;
+  }
+  return (
+    label.includes("bronze") ||
+    label.includes("silver") ||
+    label.includes("gold")
+  );
+};
+
 const deriveValuesFromLabel = (rule, fallback = []) => {
   if (fallback.length) return fallback;
   const label = normalizeString(rule?.label || rule?.raw?.label);
@@ -1178,6 +1192,12 @@ const buildPredicate = (rule) => {
   if (!rule) return null;
   const values = rule.values || [];
   const type = rule.type;
+  if (type === "player_level" && isPlayerLevelQuotaRule(rule)) {
+    const normalized = normalizeQualityValues(values);
+    if (!normalized.length) return null;
+    const allowed = new Set(normalized);
+    return (player) => allowed.has(player?.quality);
+  }
   if (type === "player_quality" || type === "player_level") {
     return buildQualityGatePredicate(rule);
   }
