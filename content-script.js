@@ -201,6 +201,8 @@ const PREF_BRIDGE_RES = "EA_DATA_PREF_RES";
 const PREF_ALLOWED_KEYS = new Set(["eaData.preferences.v1"]);
 const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
 const PRICE_BRIDGE_RESPONSE = "EA_DATA_PRICE_RESPONSE";
+const FUTGG_PLAYERS_BRIDGE_REQUEST = "EA_DATA_FUTGG_PLAYERS_REQUEST";
+const FUTGG_PLAYERS_BRIDGE_RESPONSE = "EA_DATA_FUTGG_PLAYERS_RESPONSE";
 
 // Relay page-world log messages to the content-script console.
 // The page script (ea-data-bridge.js) runs in the main world where EA overrides
@@ -601,6 +603,20 @@ const postPriceResponse = (requestId, ok, data, error) => {
   } catch {}
 };
 
+const postFutggPlayersResponse = (requestId, ok, data, error) => {
+  const detail = {
+    type: FUTGG_PLAYERS_BRIDGE_RESPONSE,
+    requestId,
+    ok: Boolean(ok),
+    data,
+    error,
+    source: SOLVER_BRIDGE_SOURCE,
+  };
+  try {
+    window.postMessage(detail, "*");
+  } catch {}
+};
+
 const handlePriceBridgeRequest = async (data) => {
   if (window !== window.top) return;
   const { type, requestId, source, ids } = data || {};
@@ -664,6 +680,45 @@ const handlePriceBridgeRequest = async (data) => {
   }
 };
 
+const handleFutggPlayersBridgeRequest = async (data) => {
+  if (window !== window.top) return;
+  const { type, requestId, source, payload } = data || {};
+  if (type !== FUTGG_PLAYERS_BRIDGE_REQUEST) return;
+  if (!requestId) return;
+  if (source !== SOLVER_BRIDGE_SOURCE) return;
+  try {
+    chrome.runtime.sendMessage(
+      {
+        type: FUTGG_PLAYERS_BRIDGE_REQUEST,
+        payload: { ...(payload && typeof payload === "object" ? payload : {}), requestId },
+      },
+      (response) => {
+        const runtimeError = chrome.runtime?.lastError;
+        if (runtimeError) {
+          postFutggPlayersResponse(requestId, false, null, {
+            code: "FUTGG_PLAYERS_BRIDGE_FAILED",
+            message: runtimeError.message || "FUT.GG players bridge failed",
+          });
+          return;
+        }
+        if (response?.ok) {
+          postFutggPlayersResponse(requestId, true, response.data, null);
+          return;
+        }
+        postFutggPlayersResponse(requestId, false, null, response?.error ?? {
+          code: "FUTGG_PLAYERS_BRIDGE_FAILED",
+          message: "FUT.GG players bridge failed",
+        });
+      },
+    );
+  } catch (error) {
+    postFutggPlayersResponse(requestId, false, null, {
+      code: "FUTGG_PLAYERS_BRIDGE_FAILED",
+      message: error?.message || "FUT.GG players bridge failed",
+    });
+  }
+};
+
 window.addEventListener(
   "message",
   (event) => {
@@ -690,6 +745,16 @@ window.addEventListener(
     if (window !== window.top) return;
     if (!isTrustedPageMessageEvent(event)) return;
     handlePriceBridgeRequest(event.data);
+  },
+  true,
+);
+
+window.addEventListener(
+  "message",
+  (event) => {
+    if (window !== window.top) return;
+    if (!isTrustedPageMessageEvent(event)) return;
+    handleFutggPlayersBridgeRequest(event.data);
   },
   true,
 );

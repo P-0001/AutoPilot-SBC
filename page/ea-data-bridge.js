@@ -1214,6 +1214,43 @@
       }
     });
 
+  const callFutggPlayersBridge = (
+    payload = {},
+    timeoutMs = PRICE_BRIDGE_TIMEOUT_MS,
+  ) =>
+    new Promise((resolve, reject) => {
+      const requestId = crypto.randomUUID();
+      const timer = setTimeout(() => {
+        futggPlayersBridgeRequests.delete(requestId);
+        reject(new Error("FUT.GG players request timed out"));
+      }, Math.max(1000, readNumeric(timeoutMs) ?? PRICE_BRIDGE_TIMEOUT_MS));
+      futggPlayersBridgeRequests.set(requestId, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      try {
+        window.postMessage(
+          {
+            type: FUTGG_PLAYERS_BRIDGE_REQUEST,
+            requestId,
+            payload,
+            source: SOLVER_BRIDGE_SOURCE,
+          },
+          "*",
+        );
+      } catch (error) {
+        clearTimeout(timer);
+        futggPlayersBridgeRequests.delete(requestId);
+        reject(error);
+      }
+    });
+
   const requestPlayerPricesForIds = (ids = [], { onDone = null } = {}) => {
     const normalized = normalizePriceIdList(ids);
     const applyPriceResult = (result) => {
@@ -1299,26 +1336,52 @@
       }
       const results = [];
       const errors = [];
-      const newIds = uncached.filter(
-        (id) => !playerPriceInFlightPromises.has(id),
-      );
-      const batchTotal = Math.ceil(newIds.length / PRICE_BRIDGE_BATCH_SIZE);
-      for (let index = 0; index < newIds.length; index += PRICE_BRIDGE_BATCH_SIZE) {
-        const batch = newIds.slice(index, index + PRICE_BRIDGE_BATCH_SIZE);
-        const batchNumber = Math.floor(index / PRICE_BRIDGE_BATCH_SIZE) + 1;
-        const promise = runBatch(batch, batchNumber, batchTotal);
-        for (const id of batch) {
-          playerPriceInFlightPromises.set(id, promise);
-        }
-      }
-      const promises = Array.from(
+      const existingPromises = Array.from(
         new Set(
           uncached
             .map((id) => playerPriceInFlightPromises.get(id))
             .filter(Boolean),
         ),
       );
-      const settled = await Promise.all(promises);
+      const newIds = uncached.filter(
+        (id) => !playerPriceInFlightPromises.has(id),
+      );
+      const batches = [];
+      for (let index = 0; index < newIds.length; index += PRICE_BRIDGE_BATCH_SIZE) {
+        batches.push(newIds.slice(index, index + PRICE_BRIDGE_BATCH_SIZE));
+      }
+      const batchTotal = batches.length;
+      const workerCount = Math.min(
+        Math.max(1, PRICE_BRIDGE_MAX_CONCURRENT_BATCHES),
+        batchTotal,
+      );
+      let nextBatchIndex = 0;
+      const runWorker = async () => {
+        while (nextBatchIndex < batches.length) {
+          const batchIndex = nextBatchIndex;
+          nextBatchIndex += 1;
+          const batch = batches[batchIndex];
+          const batchNumber = batchIndex + 1;
+          const promise = runBatch(batch, batchNumber, batchTotal);
+          for (const id of batch) {
+            playerPriceInFlightPromises.set(id, promise);
+          }
+          const result = await promise;
+          results.push(result);
+          if ((readNumeric(result?.errorCount) ?? 0) > 0) {
+            errors.push(...(Array.isArray(result?.errors) ? result.errors : []));
+          }
+          if (nextBatchIndex < batches.length && PRICE_BRIDGE_BATCH_DELAY_MS > 0) {
+            await delayMs(PRICE_BRIDGE_BATCH_DELAY_MS);
+          }
+        }
+      };
+      if (workerCount > 0) {
+        await Promise.all(
+          Array.from({ length: workerCount }, () => runWorker()),
+        );
+      }
+      const settled = await Promise.all(existingPromises);
       for (const result of settled) {
         results.push(result);
         if ((readNumeric(result?.errorCount) ?? 0) > 0) {
@@ -5573,6 +5636,7 @@
   const solverBridgeRequests = new Map();
   const prefBridgeRequests = new Map();
   const priceBridgeRequests = new Map();
+  const futggPlayersBridgeRequests = new Map();
   // Solve can occasionally take longer (large clubs / chemistry local search).
   // Keep init short, but allow solve to run longer before timing out.
   const SOLVER_BRIDGE_TIMEOUT_MS = 60000;
@@ -5590,10 +5654,14 @@
   const PREF_BRIDGE_RES = "EA_DATA_PREF_RES";
   const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
   const PRICE_BRIDGE_RESPONSE = "EA_DATA_PRICE_RESPONSE";
+  const FUTGG_PLAYERS_BRIDGE_REQUEST = "EA_DATA_FUTGG_PLAYERS_REQUEST";
+  const FUTGG_PLAYERS_BRIDGE_RESPONSE = "EA_DATA_FUTGG_PLAYERS_RESPONSE";
   const PREF_STORAGE_KEY = "eaData.preferences.v1";
   const PREF_BRIDGE_TIMEOUT_MS = 3500;
   const PRICE_BRIDGE_TIMEOUT_MS = 25000;
   const PRICE_BRIDGE_BATCH_SIZE = 10;
+  const PRICE_BRIDGE_MAX_CONCURRENT_BATCHES = 2;
+  const PRICE_BRIDGE_BATCH_DELAY_MS = 350;
   const PRICE_CACHE_TTL_MS = 10 * 60 * 1000;
   const PAGE_BRIDGE_TIMEOUT_MS = 12000;
   const PREF_CACHE_TTL_MS = 10 * 1000;
@@ -25076,6 +25144,97 @@
       : [];
   };
 
+  const normalizeFutggPlayerForConceptSolver = (row) => {
+    if (!row || typeof row !== "object") return null;
+    const definitionId = readNumeric(row?.eaId);
+    const rating = readNumeric(row?.overall);
+    if (definitionId == null || rating == null) return null;
+    const rarityId = readNumeric(row?.rarityEaId ?? row?.rarityId);
+    const preferredPositionId = readNumeric(row?.positionId);
+    const alternativePositionIds = Array.isArray(row?.alternativePositionIds)
+      ? row.alternativePositionIds
+          .map((value) => readNumeric(value))
+          .filter((value) => value != null)
+      : [];
+    const allPositionIds = Array.from(
+      new Set(
+        [preferredPositionId, ...alternativePositionIds].filter(
+          (value) => value != null,
+        ),
+      ),
+    );
+    const price = readNumeric(row?.price ?? row?.currentPrice);
+    const rarityName = row?.rarityName ?? row?.rarityGroupName ?? null;
+    const isTots =
+      rarityId === 11 ||
+      String(rarityName ?? "").toLowerCase().includes("team of the season") ||
+      String(rarityName ?? "").toLowerCase().includes("tots");
+    const isTotw =
+      rarityId === 3 ||
+      String(rarityName ?? "").toLowerCase().includes("team of the week") ||
+      String(rarityName ?? "").toLowerCase().includes("totw");
+    const name =
+      row?.nickname ??
+      row?.commonName ??
+      row?.cardName ??
+      [row?.firstName, row?.lastName].filter(Boolean).join(" ") ??
+      null;
+    return {
+      id: `concept:${definitionId}`,
+      conceptId: definitionId,
+      definitionId,
+      assetId: row?.basePlayerEaId ?? null,
+      rating,
+      name,
+      commonName: name,
+      teamId: row?.uniqueClubEaId ?? row?.club?.eaId ?? null,
+      leagueId: row?.league?.eaId ?? row?.club?.leagueEaId ?? null,
+      nationId: row?.nation?.eaId ?? null,
+      rarityId,
+      rarityName,
+      preferredPositionId,
+      preferredPositionName:
+        row?.position ?? resolvePositionNameForSolver(preferredPositionId),
+      alternativePositionIds: allPositionIds,
+      alternativePositionNames: Array.isArray(row?.alternativePositions)
+        ? row.alternativePositions.slice()
+        : allPositionIds
+            .map((positionId) => resolvePositionNameForSolver(positionId))
+            .filter(Boolean),
+      basePossiblePositions: allPositionIds,
+      preferredPosition: preferredPositionId,
+      gender: row?.gender ?? null,
+      groups: isTots ? [44] : isTotw ? [43] : [],
+      quality: getPlayerQualityBucket({ rating }),
+      isSpecial: Boolean(row?.isSpecial) || rarityId > 1,
+      isTotw,
+      isTots,
+      isTotwOrTots: isTotw || isTots,
+      conceptSpecialKind: isTots ? "tots" : isTotw ? "totw" : null,
+      isConcept: true,
+      concept: true,
+      isOwned: false,
+      isTradeable: false,
+      isUntradeable: true,
+      isStorage: false,
+      isUnassigned: false,
+      source: "futgg-cheap-concept",
+      marketPrice: price,
+      price,
+      priceLookupId: definitionId,
+      priceMeta:
+        price != null
+          ? {
+              eaId: String(definitionId),
+              price,
+              isExtinct: false,
+              cachedAt: Date.now(),
+              source: "futgg-players-sort",
+            }
+          : null,
+    };
+  };
+
   const summarizeConceptSearchResponse = (response) => ({
     success: response?.success ?? response?.data?.success ?? null,
     status: response?.status ?? response?.data?.status ?? null,
@@ -25201,6 +25360,50 @@
     );
   };
 
+  const getConceptSpecialRequirementKinds = (scopeAnalysis) => {
+    const kinds = new Set();
+    const addType = (type) => {
+      const normalized = String(type ?? "").trim().toLowerCase();
+      if (!normalized) return;
+      if (normalized === "player_tots") {
+        kinds.add("tots");
+        return;
+      }
+      if (normalized === "player_inform") {
+        kinds.add("totw");
+        return;
+      }
+      if (
+        normalized === "player_totw_or_tots" ||
+        normalized === "player_rarity_or_totw"
+      ) {
+        kinds.add("totw");
+        kinds.add("tots");
+      }
+    };
+    for (const type of scopeAnalysis?.inputs?.failingTypes ?? []) addType(type);
+    for (const entry of scopeAnalysis?.inputs?.failingRequirements ?? []) {
+      addType(entry?.type ?? entry?.keyNameNormalized ?? entry?.keyName);
+    }
+    for (const hint of scopeAnalysis?.searchHints ?? []) {
+      for (const axis of hint?.requiredAxes ?? []) addType(axis);
+    }
+    return Array.from(kinds);
+  };
+
+  const CONCEPT_SPECIAL_KIND_SEARCHES = Object.freeze({
+    totw: Object.freeze({
+      specialKind: "totw",
+      groupIds: Object.freeze([43]),
+      rarityIds: Object.freeze([3]),
+    }),
+    tots: Object.freeze({
+      specialKind: "tots",
+      groupIds: Object.freeze([44]),
+      rarityIds: Object.freeze([]),
+    }),
+  });
+
   const buildConceptSearchCriteria = (profile) => {
     const CriteriaCtor =
       window?.UTSearchCriteriaDTO ?? globalThis?.UTSearchCriteriaDTO;
@@ -25227,9 +25430,59 @@
     if (Array.isArray(profile?.rarityIds) && profile.rarityIds.length) {
       criteria.rarities = profile.rarityIds.slice();
     }
+    if (Array.isArray(profile?.groupIds) && profile.groupIds.length) {
+      const groupIds = profile.groupIds.slice();
+      criteria.groups = groupIds;
+      criteria.groupIds = groupIds;
+    }
     if (profile?.queryMinRating != null) criteria.ovrMin = profile.queryMinRating;
     if (profile?.queryMaxRating != null) criteria.ovrMax = profile.queryMaxRating;
     return criteria;
+  };
+
+  const buildConceptRatingExpansionBands = ({
+    minRating,
+    maxRating,
+    settingsRange,
+    allowOpenSpecialRating = false,
+  } = {}) => {
+    const settingsMin = readNumeric(settingsRange?.ratingMin) ?? 0;
+    const settingsMax = readNumeric(settingsRange?.ratingMax) ?? 99;
+    const baseMin = Math.max(settingsMin, readNumeric(minRating) ?? settingsMin);
+    const baseMax = Math.min(settingsMax, readNumeric(maxRating) ?? settingsMax);
+    if (baseMin > settingsMax) return [];
+    const bands = [];
+    const pushBand = (min, max, reasonSuffix = null) => {
+      const nextMin = Math.max(settingsMin, Math.floor(readNumeric(min) ?? settingsMin));
+      const nextMax = Math.min(settingsMax, Math.floor(readNumeric(max) ?? settingsMax));
+      if (nextMin > nextMax) return;
+      const key = `${nextMin}-${nextMax}`;
+      if (bands.some((band) => band.key === key)) return;
+      bands.push({
+        key,
+        minRating: nextMin,
+        maxRating: nextMax,
+        reasonSuffix,
+      });
+    };
+
+    if (allowOpenSpecialRating) {
+      pushBand(baseMin, settingsMax, "open_special_rating");
+      return bands;
+    }
+
+    pushBand(baseMin, baseMax, null);
+
+    let nextMin = baseMax + 1;
+    let bucketIndex = 1;
+    while (nextMin <= settingsMax && bands.length < 4) {
+      const nextMax = Math.min(settingsMax, nextMin + 4);
+      pushBand(nextMin, nextMax, `rating_bucket_${bucketIndex}`);
+      nextMin = nextMax + 1;
+      bucketIndex += 1;
+    }
+
+    return bands;
   };
 
   const buildConceptSearchProfiles = (scopeAnalysis, filters = {}) => {
@@ -25254,6 +25507,8 @@
         profile.teamId ?? "*",
         profile.cardBucket ?? "*",
         (profile.rarityIds ?? []).join(","),
+        (profile.groupIds ?? []).join(","),
+        profile.specialKind ?? "",
         profile.requireBaseCard ? "base" : "",
         profile.allowTotwOrTots ? "totw" : "",
         profile.minRating ?? "*",
@@ -25264,13 +25519,44 @@
       const isChemistryProfile = String(profile?.reason ?? "").includes(
         "chemistry",
       );
+      const settingsRange = normalizeRatingRange({
+        ratingMin: settings?.ratingMin ?? filters?.ratingMin,
+        ratingMax: settings?.ratingMax ?? filters?.ratingMax,
+      });
+      const profileMinRating = readNumeric(profile?.minRating);
+      const profileMaxRating = readNumeric(profile?.maxRating);
+      const allowOpenSpecialRating = Boolean(profile?.allowTotwOrTots);
+      const queryMinRating = isChemistryProfile
+        ? settingsRange.ratingMin
+        : Math.max(settingsRange.ratingMin, profileMinRating ?? settingsRange.ratingMin);
+      const queryMaxRating = isChemistryProfile
+        ? settingsRange.ratingMax
+        : allowOpenSpecialRating
+          ? settingsRange.ratingMax
+          : Math.min(settingsRange.ratingMax, profileMaxRating ?? settingsRange.ratingMax);
+      if (queryMinRating > queryMaxRating) return;
+      const isSpecialRequirementProfile = Boolean(profile?.allowTotwOrTots);
       profiles.push({
         count: 21,
-        maxPages: isChemistryProfile ? 12 : 3,
-        limit: isChemistryProfile ? 10 : 8,
+        maxPages: isChemistryProfile
+          ? 12
+          : isSpecialRequirementProfile
+            ? 12
+            : allowOpenSpecialRating
+              ? 6
+              : 3,
+        limit: isChemistryProfile
+          ? 10
+          : isSpecialRequirementProfile
+            ? profile?.specialKind === "tots"
+              ? 252
+              : 126
+            : allowOpenSpecialRating
+              ? 42
+              : 8,
         priority: profiles.length,
-        queryMinRating: settings?.ratingMin ?? filters?.ratingMin ?? null,
-        queryMaxRating: settings?.ratingMax ?? filters?.ratingMax ?? null,
+        queryMinRating,
+        queryMaxRating,
         ...profile,
       });
     };
@@ -25278,20 +25564,74 @@
     const shouldSearchSpecials =
       (settings?.useTotwPlayers ?? filters?.useTotwPlayers ?? true) !== false &&
       hasUnsatisfiedConceptSpecialNeed(scopeAnalysis);
+    const requiredSpecialKinds = getConceptSpecialRequirementKinds(scopeAnalysis);
+    const settingsRange = normalizeRatingRange({
+      ratingMin: settings?.ratingMin ?? filters?.ratingMin,
+      ratingMax: settings?.ratingMax ?? filters?.ratingMax,
+    });
+    const pushRatingBandProfiles = (profile, options = {}) => {
+      const bands = buildConceptRatingExpansionBands({
+        minRating: profile?.minRating,
+        maxRating: profile?.maxRating,
+        settingsRange,
+        allowOpenSpecialRating: Boolean(options?.allowOpenSpecialRating),
+      });
+      const sourceBands = bands.length
+        ? bands
+        : [
+            {
+              minRating: profile?.minRating,
+              maxRating: profile?.maxRating,
+              reasonSuffix: null,
+            },
+          ];
+      for (const band of sourceBands) {
+        pushProfile({
+          ...profile,
+          reason: band.reasonSuffix
+            ? `${profile.reason ?? "scope_hint"}_${band.reasonSuffix}`
+            : profile.reason,
+          minRating: band.minRating,
+          maxRating: band.maxRating,
+        });
+      }
+    };
     const pushSearchProfile = (profile) => {
       const isChemistryProfile = String(profile?.reason ?? "").includes(
         "chemistry",
       );
+      const isRatingProfile = String(profile?.reason ?? "").includes("rating");
       if (!isChemistryProfile) {
-        pushProfile({ ...profile, requireBaseCard: true });
+        if (isRatingProfile) {
+          pushRatingBandProfiles({ ...profile, requireBaseCard: true });
+        } else {
+          pushProfile({ ...profile, requireBaseCard: true });
+        }
         if (shouldSearchSpecials) {
-          pushProfile({
-            ...profile,
-            reason: `${profile.reason ?? "scope_hint"}_special_requirement`,
-            level: "special",
-            requireBaseCard: false,
-            allowTotwOrTots: true,
-          });
+          const specialKinds = requiredSpecialKinds.length
+            ? requiredSpecialKinds
+            : ["totw", "tots"];
+          for (const kind of specialKinds) {
+            const specialSearch = CONCEPT_SPECIAL_KIND_SEARCHES[kind] ?? null;
+            if (!specialSearch) continue;
+            const specialProfile = {
+              ...profile,
+              reason: `${profile.reason ?? "scope_hint"}_${kind}_requirement`,
+              level: "special",
+              rarityIds: specialSearch.rarityIds.slice(),
+              groupIds: specialSearch.groupIds.slice(),
+              specialKind: specialSearch.specialKind,
+              requireBaseCard: false,
+              allowTotwOrTots: true,
+            };
+            if (isRatingProfile) {
+              pushRatingBandProfiles(specialProfile, {
+                allowOpenSpecialRating: true,
+              });
+            } else {
+              pushProfile(specialProfile);
+            }
+          }
         }
         return;
       }
@@ -25305,13 +25645,23 @@
         });
       }
       if (shouldSearchSpecials) {
-        pushProfile({
-          ...profile,
-          reason: `${profile.reason ?? "scope_hint"}_special_requirement`,
-          level: "special",
-          requireBaseCard: false,
-          allowTotwOrTots: true,
-        });
+        const specialKinds = requiredSpecialKinds.length
+          ? requiredSpecialKinds
+          : ["totw", "tots"];
+        for (const kind of specialKinds) {
+          const specialSearch = CONCEPT_SPECIAL_KIND_SEARCHES[kind] ?? null;
+          if (!specialSearch) continue;
+          pushProfile({
+            ...profile,
+            reason: `${profile.reason ?? "scope_hint"}_${kind}_requirement`,
+            level: "special",
+            rarityIds: specialSearch.rarityIds.slice(),
+            groupIds: specialSearch.groupIds.slice(),
+            specialKind: specialSearch.specialKind,
+            requireBaseCard: false,
+            allowTotwOrTots: true,
+          });
+        }
       }
     };
 
@@ -25446,6 +25796,7 @@
       subtype: player?.subtype ?? null,
       isSpecial: Boolean(player?.isSpecial),
       isTotwOrTots: Boolean(player?.isTotwOrTots),
+      inferredTotwOrTots: Boolean(player?.__eaDataInferredTotwOrTots),
       id: player?.id ?? null,
       definitionId: player?.definitionId ?? null,
     });
@@ -25455,6 +25806,37 @@
     incrementRejectReason(diagnostics, reason);
     addConceptRejectedSample(diagnostics, reason, player);
     return false;
+  };
+
+  const conceptPlayerMatchesSpecialKind = (player, specialKind = null) => {
+    const kind = String(specialKind ?? "").trim().toLowerCase();
+    if (!kind) return Boolean(player?.isTotwOrTots);
+    const rarityName = String(player?.rarityName ?? "").trim().toLowerCase();
+    const groups = new Set(
+      (Array.isArray(player?.groups) ? player.groups : [])
+        .map((group) => readNumeric(group))
+        .filter((group) => group != null),
+    );
+    const rarityId = readNumeric(player?.rarityId);
+    if (kind === "totw") {
+      return (
+        Boolean(player?.isTotw) ||
+        rarityId === 3 ||
+        groups.has(43) ||
+        rarityName.includes("team of the week") ||
+        rarityName.includes("totw") ||
+        rarityName.includes("inform")
+      );
+    }
+    if (kind === "tots") {
+      return (
+        Boolean(player?.isTots) ||
+        groups.has(44) ||
+        rarityName.includes("team of the season") ||
+        rarityName.includes("tots")
+      );
+    }
+    return Boolean(player?.isTotwOrTots);
   };
 
   const passesConceptProfileFilters = ({
@@ -25472,6 +25854,7 @@
     const isChemistryProfile = String(profile?.reason ?? "").includes(
       "chemistry",
     );
+    const allowOpenSpecialRating = Boolean(profile?.allowTotwOrTots);
     if (
       !isChemistryProfile &&
       minRating != null &&
@@ -25482,6 +25865,7 @@
     }
     if (
       !isChemistryProfile &&
+      !allowOpenSpecialRating &&
       maxRating != null &&
       rating != null &&
       rating > maxRating
@@ -25539,8 +25923,27 @@
     if (!profile?.allowTotwOrTots && player?.isTotwOrTots) {
       return rejectConceptCandidate(diagnostics, "totw_tots_not_requested", player);
     }
-    if (profile?.allowTotwOrTots && player?.isSpecial && !player?.isTotwOrTots) {
-      return rejectConceptCandidate(diagnostics, "special_not_totw_tots", player);
+    if (profile?.allowTotwOrTots) {
+      if (!conceptPlayerMatchesSpecialKind(player, profile?.specialKind)) {
+        return rejectConceptCandidate(
+          diagnostics,
+          profile?.specialKind === "tots"
+            ? "special_not_tots"
+            : profile?.specialKind === "totw"
+              ? "special_not_totw"
+              : "special_not_totw_tots",
+          player,
+        );
+      }
+      player.isTotwOrTots = true;
+      if (profile?.specialKind === "tots") {
+        player.isTots = true;
+        player.conceptSpecialKind = "tots";
+      }
+      if (profile?.specialKind === "totw") {
+        player.isTotw = true;
+        player.conceptSpecialKind = "totw";
+      }
     }
     if (profile?.requireBaseCard && player?.isSpecial) {
       return rejectConceptCandidate(
@@ -25676,6 +26079,8 @@
             teamId: player?.teamId ?? null,
             rarityId: player?.rarityId ?? null,
             isSpecial: Boolean(player?.isSpecial),
+            isTotwOrTots: Boolean(player?.isTotwOrTots),
+            inferredTotwOrTots: Boolean(player?.__eaDataInferredTotwOrTots),
             id: player?.id ?? null,
             definitionId: player?.definitionId ?? null,
           });
@@ -25776,7 +26181,9 @@
           position: profile?.position ?? null,
           level: profile?.level ?? null,
           cardBucket: profile?.cardBucket ?? null,
+          specialKind: profile?.specialKind ?? null,
           rarityIds: profile?.rarityIds ?? [],
+          groupIds: profile?.groupIds ?? [],
           leagueId: profile?.leagueId ?? null,
           nationId: profile?.nationId ?? null,
           teamId: profile?.teamId ?? null,
@@ -25793,18 +26200,30 @@
         pages: result.diagnostics.pages,
       });
     }
-    const retryCandidateLimit = 240;
+    const futggCheap = await fetchFutggCheapConceptCandidatesForSolve({
+      scopeAnalysis,
+      profiles,
+      filters,
+      ownedDefinitionIds,
+      keptDefinitionIds,
+    });
+    diagnostics.futggCheap = futggCheap.diagnostics ?? null;
+    if (futggCheap.candidates?.length) {
+      candidateGroups.unshift(futggCheap.candidates.slice());
+      diagnostics.candidatesKept += futggCheap.candidates.length;
+      console.log("[EA Data] Concept solver FUT.GG cheap candidates", {
+        stage: "concept",
+        action: "futgg_cheapest",
+        ...(futggCheap.diagnostics ?? {}),
+      });
+    }
     const candidates = [];
     const queues = candidateGroups.map((group) => group.slice());
-    while (
-      candidates.length < retryCandidateLimit &&
-      queues.some((group) => group.length)
-    ) {
+    while (queues.some((group) => group.length)) {
       for (const group of queues) {
         const next = group.shift();
         if (!next) continue;
         candidates.push(next);
-        if (candidates.length >= retryCandidateLimit) break;
       }
     }
     diagnostics.retryPoolSelection = {
@@ -25814,7 +26233,8 @@
       ),
       selectedCandidates: candidates.length,
       candidateGroups: candidateGroups.length,
-      limit: retryCandidateLimit,
+      limit: null,
+      note: "uncapped_before_price_sort",
     };
     diagnostics.candidateSample = candidates.slice(0, 12).map((player) => ({
       name: player?.name ?? null,
@@ -25837,6 +26257,8 @@
       teamId: player?.teamId ?? null,
       rarityId: player?.rarityId ?? null,
       isSpecial: Boolean(player?.isSpecial),
+      isTotwOrTots: Boolean(player?.isTotwOrTots),
+      inferredTotwOrTots: Boolean(player?.__eaDataInferredTotwOrTots),
     }));
     return { candidates, diagnostics };
   };
@@ -25847,6 +26269,315 @@
     if (!result.stats || typeof result.stats !== "object") result.stats = {};
     result.stats.conceptDiagnostics = diagnostics;
     return result;
+  };
+
+  const attachPriceMetaToConceptCandidates = async (candidates = []) => {
+    const list = Array.isArray(candidates) ? candidates : [];
+    const ids = normalizePriceIdList(
+      list
+        .filter(
+          (player) =>
+            readNumeric(
+              player?.marketPrice ?? player?.price ?? player?.priceMeta?.price,
+            ) == null,
+        )
+        .map((player) => player?.definitionId ?? player?.conceptId),
+    );
+    if (ids.length) {
+      await requestPlayerPricesForIds(ids);
+    }
+    let priced = 0;
+    let missing = 0;
+    let extinct = 0;
+    for (const player of list) {
+      if (!player || typeof player !== "object") continue;
+      const priceLookupId = player?.definitionId ?? player?.conceptId ?? null;
+      const existingPrice = readNumeric(
+        player?.marketPrice ?? player?.price ?? player?.priceMeta?.price,
+      );
+      if (existingPrice != null) {
+        const nextMeta = {
+          ...(player?.priceMeta && typeof player.priceMeta === "object"
+            ? player.priceMeta
+            : {}),
+          eaId: String(priceLookupId ?? ""),
+          price: existingPrice,
+          isExtinct: false,
+          cachedAt: readNumeric(player?.priceMeta?.cachedAt) ?? Date.now(),
+        };
+        player.priceLookupId = priceLookupId;
+        player.priceMeta = nextMeta;
+        player.marketPrice = existingPrice;
+        player.price = existingPrice;
+        if (priceLookupId != null) {
+          playerPriceCache.set(String(priceLookupId), nextMeta);
+        }
+        priced += 1;
+        continue;
+      }
+      const priceMeta = getEffectivePlayerPriceMeta(priceLookupId);
+      player.priceLookupId = priceLookupId;
+      player.priceMeta = priceMeta;
+      const price = readNumeric(priceMeta?.price);
+      if (priceMeta?.isExtinct) {
+        player.isExtinct = true;
+        player.marketPrice = null;
+        extinct += 1;
+      } else if (price != null) {
+        player.marketPrice = price;
+        player.price = price;
+        priced += 1;
+      } else {
+        player.marketPrice = null;
+        missing += 1;
+      }
+    }
+    return { requested: ids.length, priced, missing, extinct };
+  };
+
+  const summarizeConceptPriceCandidate = (player) => ({
+    name: player?.name ?? null,
+    rating: player?.rating ?? null,
+    position:
+      player?.preferredPositionName ??
+      player?.preferredPosition ??
+      player?.position ??
+      null,
+    definitionId: player?.definitionId ?? null,
+    conceptId: player?.conceptId ?? null,
+    assetId: player?.assetId ?? null,
+    rarityId: player?.rarityId ?? null,
+    rarityName: player?.rarityName ?? null,
+    specialKind:
+      player?.conceptSpecialKind ??
+      (player?.isTots ? "tots" : player?.isTotw ? "totw" : null),
+    marketPrice: readNumeric(player?.marketPrice),
+    priceMissing: player?.marketPrice == null && !player?.isExtinct,
+    isExtinct: Boolean(player?.isExtinct),
+    priceError: player?.priceMeta?.error ?? null,
+  });
+
+  const summarizeConceptPriceSelection = (candidates = []) => {
+    const list = Array.isArray(candidates) ? candidates : [];
+    const byKind = {};
+    for (const kind of ["totw", "tots"]) {
+      const group = list.filter((player) => {
+        const playerKind =
+          player?.conceptSpecialKind ??
+          (player?.isTots ? "tots" : player?.isTotw ? "totw" : null);
+        return playerKind === kind;
+      });
+      byKind[kind] = {
+        count: group.length,
+        priced: group.filter(
+          (player) => readNumeric(player?.marketPrice) != null,
+        ).length,
+        extinct: group.filter((player) => player?.isExtinct).length,
+        missing: group.filter(
+          (player) => player?.marketPrice == null && !player?.isExtinct,
+        ).length,
+        cheapest: group
+          .slice()
+          .sort(comparePricedConceptCandidates)
+          .slice(0, 8)
+          .map(summarizeConceptPriceCandidate),
+      };
+    }
+    return byKind;
+  };
+
+  const comparePricedConceptCandidates = (a, b) => {
+    const extinctA = a?.isExtinct || a?.priceMeta?.isExtinct ? 1 : 0;
+    const extinctB = b?.isExtinct || b?.priceMeta?.isExtinct ? 1 : 0;
+    if (extinctA !== extinctB) return extinctA - extinctB;
+    const priceA = readNumeric(a?.marketPrice ?? a?.price ?? a?.priceMeta?.price);
+    const priceB = readNumeric(b?.marketPrice ?? b?.price ?? b?.priceMeta?.price);
+    const missingA = priceA == null ? 1 : 0;
+    const missingB = priceB == null ? 1 : 0;
+    if (missingA !== missingB) return missingA - missingB;
+    if (priceA != null && priceB != null && priceA !== priceB) {
+      return priceA - priceB;
+    }
+    return (readNumeric(a?.rating) ?? 0) - (readNumeric(b?.rating) ?? 0);
+  };
+
+  const fetchFutggCheapConceptCandidatesForSolve = async ({
+    scopeAnalysis,
+    profiles = [],
+    filters,
+    ownedDefinitionIds,
+    keptDefinitionIds,
+  } = {}) => {
+    if (!scopeAnalysis?.conceptSearchEligible) {
+      return { candidates: [], diagnostics: { skippedReason: "not_eligible" } };
+    }
+    if (!filters?.allowConceptPlayers || filters?.onlyStorage) {
+      return { candidates: [], diagnostics: { skippedReason: "disabled" } };
+    }
+    const specialKinds = getConceptSpecialRequirementKinds(scopeAnalysis);
+    const rarityIds = [];
+    if (specialKinds.includes("tots")) rarityIds.push(11);
+    if (specialKinds.includes("totw")) rarityIds.push(3);
+    if (!rarityIds.length) {
+      return { candidates: [], diagnostics: { skippedReason: "no_special_need" } };
+    }
+    const buildBridgeFilters = (extra = {}) => {
+      const bridgeFilters = { ...extra };
+      const minRating = readNumeric(filters?.ratingMin);
+      const maxRating = readNumeric(filters?.ratingMax);
+      if (minRating != null && minRating > 0) {
+        bridgeFilters.overall__gte = minRating;
+      }
+      if (maxRating != null && maxRating < 99) {
+        bridgeFilters.overall__lte = maxRating;
+      }
+      return bridgeFilters;
+    };
+    const buildScopedFilters = (profile) => {
+      const scoped = {};
+      const leagueId = readNumeric(profile?.leagueId);
+      const nationId = readNumeric(profile?.nationId);
+      const teamId = readNumeric(profile?.teamId);
+      if (leagueId != null) scoped.league_id = leagueId;
+      if (nationId != null) scoped.nation_id = nationId;
+      if (teamId != null) scoped.club_id = teamId;
+      return scoped;
+    };
+    const requestDescriptors = [
+      {
+        label: "global",
+        filters: buildBridgeFilters(),
+      },
+    ];
+    const seenRequestKeys = new Set(["global:{}"]);
+    for (const profile of Array.isArray(profiles) ? profiles : []) {
+      if (profile?.specialKind && !specialKinds.includes(profile.specialKind)) {
+        continue;
+      }
+      const scoped = buildScopedFilters(profile);
+      if (!Object.keys(scoped).length) continue;
+      const key = JSON.stringify(scoped);
+      if (seenRequestKeys.has(key)) continue;
+      seenRequestKeys.add(key);
+      requestDescriptors.push({
+        label: profile?.reason ?? "scoped",
+        filters: buildBridgeFilters(scoped),
+      });
+      if (requestDescriptors.length >= 5) break;
+    }
+    const responses = [];
+    for (const descriptor of requestDescriptors) {
+      try {
+        const response = await callFutggPlayersBridge({
+          rarityIds,
+          pages: descriptor.label === "global" ? 5 : 3,
+          priceGte: 200,
+          sorts: "current_price",
+          filters: descriptor.filters,
+        });
+        responses.push({ ...descriptor, response });
+      } catch (error) {
+        responses.push({
+          ...descriptor,
+          response: null,
+          error: String(error?.message ?? error),
+        });
+      }
+    }
+    if (!responses.some((entry) => Array.isArray(entry.response?.rows))) {
+      return {
+        candidates: [],
+        diagnostics: {
+          skippedReason: "bridge_error",
+          requests: responses.map(({ label, filters: requestFilters, error }) => ({
+            label,
+            filters: requestFilters,
+            error: error ?? null,
+          })),
+        },
+      };
+    }
+    const rows = [];
+    const rowKeys = new Set();
+    for (const entry of responses) {
+      for (const row of Array.isArray(entry.response?.rows)
+        ? entry.response.rows
+        : []) {
+        const key = row?.eaId == null ? null : String(row.eaId);
+        if (key && rowKeys.has(key)) continue;
+        if (key) rowKeys.add(key);
+        rows.push(row);
+      }
+    }
+    const candidates = [];
+    const rejectedByReason = {};
+    const increment = (reason) => {
+      const key = reason || "unknown";
+      rejectedByReason[key] = (readNumeric(rejectedByReason[key]) ?? 0) + 1;
+    };
+    const profile = {
+      reason: "futgg_cheapest_specials",
+      minRating: filters?.ratingMin ?? 0,
+      maxRating: filters?.ratingMax ?? 99,
+      allowTotwOrTots: true,
+    };
+    const keptDefs = keptDefinitionIds instanceof Set ? keptDefinitionIds : new Set();
+    for (const row of rows) {
+      const player = normalizeFutggPlayerForConceptSolver(row);
+      if (!player) {
+        increment("normalize_failed");
+        continue;
+      }
+      const specialKind = player?.isTots ? "tots" : player?.isTotw ? "totw" : null;
+      if (!specialKind || !specialKinds.includes(specialKind)) {
+        increment("wrong_special_kind");
+        continue;
+      }
+      const scopedProfile = { ...profile, specialKind };
+      const beforeRejects = {};
+      const diagnostics = {
+        rejectedByReason: beforeRejects,
+        rejectedSample: [],
+      };
+      if (
+        !passesConceptProfileFilters({
+          player,
+          profile: scopedProfile,
+          filters,
+          scopeAnalysis,
+          ownedDefinitionIds,
+          keptDefinitionIds: keptDefs,
+          diagnostics,
+        })
+      ) {
+        const reason = Object.keys(beforeRejects)[0] ?? "profile_rejected";
+        increment(reason);
+        continue;
+      }
+      const defKey = player?.definitionId == null ? null : String(player.definitionId);
+      if (defKey) keptDefs.add(defKey);
+      candidates.push(player);
+    }
+    candidates.sort(comparePricedConceptCandidates);
+    return {
+      candidates,
+      diagnostics: {
+        requestedRarityIds: rarityIds,
+        requests: responses.map(({ label, filters: requestFilters, response, error }) => ({
+          label,
+          filters: response?.filters ?? requestFilters,
+          rowCount: response?.rowCount ?? 0,
+          pages: response?.pages ?? null,
+          error: error ?? null,
+        })),
+        rowCount: rows.length,
+        kept: candidates.length,
+        rejectedByReason,
+        priceSource: "futgg_players_sort",
+        cheapest: candidates.slice(0, 12).map(summarizeConceptPriceCandidate),
+        bridgeErrors: responses.flatMap((entry) => entry.response?.errors ?? []),
+      },
+    };
   };
 
   const solveWithConceptFallback = async ({
@@ -25896,12 +26627,35 @@
 
     try {
       onStatus?.({
+        phase: "concept_prices",
+        label: `Fetching concept prices (${candidates.length} candidates)...`,
+      });
+    } catch {}
+    diagnostics.priceLookup = await attachPriceMetaToConceptCandidates(
+      candidates,
+    );
+    candidates.sort(comparePricedConceptCandidates);
+    const retryCandidateLimit = 240;
+    const retryCandidates = candidates.slice(0, retryCandidateLimit);
+    diagnostics.priceSelection = {
+      availableCandidates: candidates.length,
+      selectedCandidates: retryCandidates.length,
+      limit: retryCandidateLimit,
+      note: "cheapest_after_price_sort",
+      byKind: summarizeConceptPriceSelection(candidates),
+    };
+    diagnostics.candidateSample = candidates
+      .slice(0, 12)
+      .map(summarizeConceptPriceCandidate);
+
+    try {
+      onStatus?.({
         phase: "concept_solve",
         label: `Solving with concept fallback (${candidates.length} candidates)...`,
       });
     } catch {}
     if (playerById && typeof playerById.set === "function") {
-      for (const player of candidates) {
+      for (const player of retryCandidates) {
         if (player?.id == null) continue;
         playerById.set(String(player.id), player);
         playerById.set(player.id, player);
@@ -25910,7 +26664,7 @@
 
     const retryResult = await callSolveBridge(
       {
-        players: (Array.isArray(players) ? players : []).concat(candidates),
+        players: (Array.isArray(players) ? players : []).concat(retryCandidates),
         _cacheRevision: payload?._cacheRevision ?? null,
         requirements,
         requirementsNormalized,
@@ -25955,6 +26709,12 @@
         retryResult?.conceptPlayersUsed ??
         retryResult?.stats?.conceptPlayersUsed ??
         [],
+      conceptPriceTotal:
+        retryResult?.stats?.solvedValue?.conceptPriceTotal ?? null,
+      conceptPriceMissing:
+        retryResult?.stats?.solvedValue?.conceptPriceMissingCount ?? null,
+      conceptPriceExtinct:
+        retryResult?.stats?.solvedValue?.conceptPriceExtinctCount ?? null,
       failingRequirements: retryResult?.failingRequirements ?? [],
       chemistry: retryResult?.stats?.chemistry ?? null,
       chemistryTargets: retryResult?.stats?.chemistryTargets ?? null,
@@ -25964,8 +26724,11 @@
       candidatesFetched: diagnostics?.candidatesFetched ?? 0,
       candidatesKept: diagnostics?.candidatesKept ?? 0,
       candidateSample: diagnostics?.candidateSample ?? [],
-      retryPoolConceptCandidates: candidates.length,
-      retryPoolSelection: diagnostics?.retryPoolSelection ?? null,
+      priceLookup: diagnostics?.priceLookup ?? null,
+      futggCheap: diagnostics?.futggCheap ?? null,
+      retryPoolConceptCandidates: retryCandidates.length,
+      retryPoolSelection:
+        diagnostics?.priceSelection ?? diagnostics?.retryPoolSelection ?? null,
     };
     console.log("[EA Data] Concept solver retry summary", {
       stage: "concept",
@@ -29622,6 +30385,15 @@
       else pending.reject(data.error);
       return;
     }
+    if (type === FUTGG_PLAYERS_BRIDGE_RESPONSE && requestId) {
+      if (source !== SOLVER_BRIDGE_SOURCE) return;
+      const pending = futggPlayersBridgeRequests.get(requestId);
+      if (!pending) return;
+      futggPlayersBridgeRequests.delete(requestId);
+      if (data.ok) pending.resolve(data.data);
+      else pending.reject(data.error);
+      return;
+    }
     if (type === SOLVER_BRIDGE_RESPONSE && requestId) {
       if (source !== SOLVER_BRIDGE_SOURCE) return;
       const pending = solverBridgeRequests.get(requestId);
@@ -29636,6 +30408,7 @@
       (type === PREF_BRIDGE_GET ||
         type === PREF_BRIDGE_SET ||
         type === PRICE_BRIDGE_REQUEST ||
+        type === FUTGG_PLAYERS_BRIDGE_REQUEST ||
         type === SOLVER_BRIDGE_REQUEST) &&
       requestId
     ) {

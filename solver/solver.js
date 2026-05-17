@@ -3112,6 +3112,37 @@ const buildSupplyMaps = (pool) => ({
   nation: countByAttr(pool, "nationId"),
 });
 
+const getPlayerMarketPrice = (player) => {
+  if (!player || typeof player !== "object") return null;
+  const candidates = [
+    player.marketPrice,
+    player.price,
+    player.priceMeta?.price,
+    player.futggPrice,
+    player.buyNowPrice,
+  ];
+  for (const value of candidates) {
+    const price = toNumber(value);
+    if (price != null) return price;
+  }
+  return null;
+};
+
+const compareConceptPricePriority = (a, b) => {
+  const extinctA = a?.isExtinct || a?.priceMeta?.isExtinct ? 1 : 0;
+  const extinctB = b?.isExtinct || b?.priceMeta?.isExtinct ? 1 : 0;
+  if (extinctA !== extinctB) return extinctA - extinctB;
+  const priceA = getPlayerMarketPrice(a);
+  const priceB = getPlayerMarketPrice(b);
+  const missingA = priceA == null ? 1 : 0;
+  const missingB = priceB == null ? 1 : 0;
+  if (missingA !== missingB) return missingA - missingB;
+  if (priceA != null && priceB != null && priceA !== priceB) {
+    return priceA - priceB;
+  }
+  return (toNumber(a?.rating) ?? 0) - (toNumber(b?.rating) ?? 0);
+};
+
 const getSolvedSquadValueMetrics = (
   squad,
   pool,
@@ -3141,6 +3172,24 @@ const getSolvedSquadValueMetrics = (
   );
   const storageUsage = getStorageUsageMetrics(list);
   const conceptUsage = getConceptUsageMetrics(list);
+  const conceptPlayers = list.filter(isConceptPlayer);
+  const conceptPriceStats = conceptPlayers.reduce(
+    (acc, player) => {
+      if (player?.isExtinct || player?.priceMeta?.isExtinct) {
+        acc.extinctCount += 1;
+        return acc;
+      }
+      const price = getPlayerMarketPrice(player);
+      if (price == null) {
+        acc.missingCount += 1;
+        return acc;
+      }
+      acc.total += price;
+      acc.knownCount += 1;
+      return acc;
+    },
+    { total: 0, knownCount: 0, missingCount: 0, extinctCount: 0 },
+  );
   const signature = options?.signature ?? null;
   const composition = buildCompositionSnapshot(list, list.length);
 
@@ -3288,6 +3337,10 @@ const getSolvedSquadValueMetrics = (
     highRatingScore: preservation.highScore,
     highRatingCount: preservation.highCount,
     conceptCount: conceptUsage.conceptCount,
+    conceptPriceTotal: conceptPriceStats.total,
+    conceptPriceKnownCount: conceptPriceStats.knownCount,
+    conceptPriceMissingCount: conceptPriceStats.missingCount,
+    conceptPriceExtinctCount: conceptPriceStats.extinctCount,
     conceptPlayerIds: conceptUsage.conceptPlayerIds,
     conceptDefinitionIds: conceptUsage.conceptDefinitionIds,
     identityBalancePenalty,
@@ -3306,14 +3359,20 @@ const getSolvedSquadValueMetrics = (
 
 const isSolvedSquadValueBetter = (candidate, current) => {
   if (!candidate || !current) return false;
+  if (candidate.conceptCount !== current.conceptCount)
+    return candidate.conceptCount < current.conceptCount;
+  if (candidate.conceptPriceExtinctCount !== current.conceptPriceExtinctCount)
+    return candidate.conceptPriceExtinctCount < current.conceptPriceExtinctCount;
+  if (candidate.conceptPriceMissingCount !== current.conceptPriceMissingCount)
+    return candidate.conceptPriceMissingCount < current.conceptPriceMissingCount;
+  if (candidate.conceptPriceTotal !== current.conceptPriceTotal)
+    return candidate.conceptPriceTotal < current.conceptPriceTotal;
   if (candidate.ratingExcess !== current.ratingExcess)
     return candidate.ratingExcess < current.ratingExcess;
   if (candidate.excessInformCount !== current.excessInformCount)
     return candidate.excessInformCount < current.excessInformCount;
   if (candidate.excessSpecialCount !== current.excessSpecialCount)
     return candidate.excessSpecialCount < current.excessSpecialCount;
-  if (candidate.conceptCount !== current.conceptCount)
-    return candidate.conceptCount < current.conceptCount;
   if (candidate.highRatingScore !== current.highRatingScore)
     return candidate.highRatingScore < current.highRatingScore;
   if (candidate.highRatingCount !== current.highRatingCount)
@@ -3428,6 +3487,15 @@ const buildRefinementCandidatePool = (
   };
 
   const nearPivot = scored.slice().sort(desirabilitySort).slice(0, maxCandidates);
+  const cheapConcepts = scored
+    .filter((entry) => isConceptPlayer(entry.player))
+    .slice()
+    .sort((a, b) => {
+      const priceDiff = compareConceptPricePriority(a.player, b.player);
+      if (priceDiff !== 0) return priceDiff;
+      return desirabilitySort(a, b);
+    })
+    .slice(0, Math.min(80, maxCandidates));
   const lowRated = scored
     .slice()
     .sort((a, b) => {
@@ -3440,7 +3508,7 @@ const buildRefinementCandidatePool = (
     .slice(0, Math.min(40, maxCandidates));
   const combined = [];
   const seen = new Set();
-  for (const list of [nearPivot, lowRated]) {
+  for (const list of [cheapConcepts, nearPivot, lowRated]) {
     for (const entry of list) {
       const id = entry?.player?.id ?? null;
       if (id == null || seen.has(id)) continue;
@@ -11188,6 +11256,10 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
     // Soft-discourage specials: at equal rating, non-specials come first in pool ordering.
     // This passively makes fill/swap prefer non-specials without blocking specials.
     pool.sort((a, b) => {
+      if (isConceptPlayer(a) && isConceptPlayer(b)) {
+        const conceptPriceDiff = compareConceptPricePriority(a, b);
+        if (conceptPriceDiff !== 0) return conceptPriceDiff;
+      }
       const seedBiasDiff =
         getSeedPoolBiasScore(a, contextSeed) -
         getSeedPoolBiasScore(b, contextSeed);
@@ -12108,6 +12180,12 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       nationId: player?.nationId ?? null,
       teamId: player?.teamId ?? null,
       rarityId: player?.rarityId ?? null,
+      price: getPlayerMarketPrice(player),
+      priceMissing:
+        getPlayerMarketPrice(player) == null &&
+        !player?.isExtinct &&
+        !player?.priceMeta?.isExtinct,
+      isExtinct: Boolean(player?.isExtinct || player?.priceMeta?.isExtinct),
     }));
   const solvedValue = solved
     ? getSolvedSquadValueMetrics(

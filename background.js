@@ -3,16 +3,33 @@ const SOLVER_PORT_NAME = "EA_SOLVER_PORT";
 const WORKER_RESPONSE = "SOLVER_WORKER_RESPONSE";
 const BRIDGE_INJECT_REQUEST = "EA_PAGE_BRIDGE_INJECT";
 const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
+const FUTGG_PLAYERS_BRIDGE_REQUEST = "EA_DATA_FUTGG_PLAYERS_REQUEST";
 const ALLOWED_BRIDGE_INJECT_PATHS = new Set(["page/ea-data-bridge.js"]);
 const EA_WEBAPP_URL_RE =
   /^https:\/\/www\.ea\.com(?:\/[^/?#]+)?\/ea-sports-fc\/ultimate-team\/web-app(?:\/|$)/i;
 const FUT_PRICE_API_URL = "https://www.fut.gg/api/fut/player-prices/26/";
+const FUT_PLAYERS_API_URL = "https://www.fut.gg/api/fut/players/v2/26/";
 const FUT_PRICE_CACHE_TTL_MS = 10 * 60 * 1000;
 const FUT_PRICE_BATCH_SIZE = 10;
 const FUT_PRICE_MIN_GAP_MS = 450;
 const FUT_PRICE_MAX_IDS_PER_REQUEST = 1000;
 const FUT_PRICE_FETCH_TIMEOUT_MS = 10000;
 const FUT_PRICE_RETRY_DELAY_MS = 900;
+const FUT_PLAYERS_FETCH_TIMEOUT_MS = 12000;
+const FUT_PLAYERS_MIN_GAP_MS = 700;
+const FUT_PLAYERS_MAX_PAGES = 5;
+const FUT_PLAYERS_PRICE_GTE = 200;
+const FUT_PLAYERS_ALLOWED_FILTERS = new Set([
+  "club_id",
+  "current_price__lte",
+  "league_id",
+  "nation_id",
+  "overall__gte",
+  "overall__lte",
+  "price__gte",
+  "price__lte",
+  "rarity_id",
+]);
 import {
   buildSolverContext,
   solveSquad,
@@ -127,6 +144,8 @@ const handleBridgeInjectRequest = async (message, sender, sendResponse) => {
 const futPriceCache = new Map();
 let futPriceQueue = Promise.resolve();
 let futPriceLastFetchAt = 0;
+let futPlayersQueue = Promise.resolve();
+let futPlayersLastFetchAt = 0;
 
 const normalizePriceIds = (ids) => {
   const source = Array.isArray(ids) ? ids : [];
@@ -149,6 +168,12 @@ const paceFutPriceFetch = async () => {
   const waitMs = futPriceLastFetchAt + FUT_PRICE_MIN_GAP_MS - Date.now();
   if (waitMs > 0) await delayMs(waitMs);
   futPriceLastFetchAt = Date.now();
+};
+
+const paceFutPlayersFetch = async () => {
+  const waitMs = futPlayersLastFetchAt + FUT_PLAYERS_MIN_GAP_MS - Date.now();
+  if (waitMs > 0) await delayMs(waitMs);
+  futPlayersLastFetchAt = Date.now();
 };
 
 const markFutPriceBatchMissing = (ids, reason = null) => {
@@ -320,6 +345,149 @@ const handlePriceRequest = (message, sendResponse) => {
     });
 };
 
+const normalizeFutPlayersRequest = (payload = {}) => {
+  const pagesRaw = Number(payload?.pages);
+  const pages = Number.isFinite(pagesRaw)
+    ? Math.max(1, Math.min(FUT_PLAYERS_MAX_PAGES, Math.floor(pagesRaw)))
+    : 2;
+  const rarityIds = Array.isArray(payload?.rarityIds)
+    ? payload.rarityIds
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value > 0)
+        .slice(0, 6)
+    : [];
+  const priceGteRaw = Number(payload?.priceGte);
+  const priceGte = Number.isFinite(priceGteRaw)
+    ? Math.max(0, Math.floor(priceGteRaw))
+    : FUT_PLAYERS_PRICE_GTE;
+  const sorts = String(payload?.sorts || "current_price");
+  const rawFilters =
+    payload?.filters && typeof payload.filters === "object"
+      ? payload.filters
+      : {};
+  const filters = {};
+  for (const [key, value] of Object.entries(rawFilters)) {
+    if (!FUT_PLAYERS_ALLOWED_FILTERS.has(key)) continue;
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) continue;
+    filters[key] = Math.floor(numeric);
+  }
+  return { pages, rarityIds, priceGte, sorts, filters };
+};
+
+const fetchFutPlayersPage = async ({
+  page,
+  rarityId,
+  priceGte,
+  sorts,
+  filters = {},
+}) => {
+  await paceFutPlayersFetch();
+  const url = new URL(FUT_PLAYERS_API_URL);
+  url.searchParams.set("page", String(page));
+  if (rarityId != null) url.searchParams.set("rarity_id", String(rarityId));
+  url.searchParams.set("price__gte", String(priceGte));
+  for (const [key, value] of Object.entries(filters)) {
+    if (key === "rarity_id" || key === "price__gte") continue;
+    url.searchParams.set(key, String(value));
+  }
+  url.searchParams.set("sorts", sorts);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    try {
+      controller.abort();
+    } catch {}
+  }, FUT_PLAYERS_FETCH_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(url.toString(), {
+      method: "GET",
+      credentials: "omit",
+      cache: "no-store",
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+  if (!response.ok)
+    throw new Error(`FUT.GG players request failed (${response.status})`);
+  return response.json();
+};
+
+const handleFutPlayersRequest = (message, sendResponse) => {
+  const requestId = message?.payload?.requestId ?? null;
+  const params = normalizeFutPlayersRequest(message?.payload ?? {});
+  console.log("[EA Data] FUT.GG players request received", {
+    requestId,
+    pages: params.pages,
+    rarityIds: params.rarityIds,
+    priceGte: params.priceGte,
+    sorts: params.sorts,
+    filters: params.filters,
+  });
+
+  futPlayersQueue = futPlayersQueue
+    .catch(() => {})
+    .then(async () => {
+      const rows = [];
+      const errors = [];
+      const rarityIds = params.rarityIds.length ? params.rarityIds : [null];
+      for (const rarityId of rarityIds) {
+        for (let page = 1; page <= params.pages; page += 1) {
+          try {
+            const json = await fetchFutPlayersPage({
+              page,
+              rarityId,
+              priceGte: params.priceGte,
+              sorts: params.sorts,
+              filters: params.filters,
+            });
+            const pageRows = Array.isArray(json?.data) ? json.data : [];
+            rows.push(...pageRows);
+            console.log("[EA Data] FUT.GG players page", {
+              requestId,
+              rarityId,
+              page,
+              count: pageRows.length,
+            });
+            if (!pageRows.length) break;
+          } catch (error) {
+            errors.push({
+              rarityId,
+              page,
+              message: error?.message || String(error),
+            });
+            break;
+          }
+        }
+      }
+      sendResponse({
+        ok: true,
+        data: {
+          rows,
+          requestedRarityIds: params.rarityIds,
+          pages: params.pages,
+          priceGte: params.priceGte,
+          sorts: params.sorts,
+          filters: params.filters,
+          rowCount: rows.length,
+          errorCount: errors.length,
+          errors,
+        },
+      });
+    })
+    .catch((error) => {
+      sendResponse({
+        ok: false,
+        error: {
+          code: "FUTGG_PLAYERS_REQUEST_FAILED",
+          message: error?.message || "FUT.GG players request failed",
+        },
+      });
+    });
+};
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === BRIDGE_INJECT_REQUEST) {
     handleBridgeInjectRequest(message, sender, sendResponse);
@@ -327,6 +495,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === PRICE_BRIDGE_REQUEST) {
     handlePriceRequest(message, sendResponse);
+    return true;
+  }
+  if (message?.type === FUTGG_PLAYERS_BRIDGE_REQUEST) {
+    handleFutPlayersRequest(message, sendResponse);
     return true;
   }
   if (!message || message.type !== SOLVER_BRIDGE_REQUEST) return false;
