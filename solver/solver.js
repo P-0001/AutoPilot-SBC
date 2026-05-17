@@ -3,6 +3,10 @@ import {
   computeBestChemistryAssignment,
   normalizeSlotsForChemistry,
 } from "./chemistry.js";
+import {
+  getConceptUsageMetrics,
+  isConceptPlayer,
+} from "./concept-players.js";
 
 const ROUND_DECIMALS = 2;
 const ROUND_THRESHOLD = 0.96;
@@ -492,6 +496,7 @@ const normalizePlayers = (players) => {
       typeof item.isEvolution === "function"
         ? Boolean(item.isEvolution())
         : Boolean(item.isEvolution ?? item.upgrades);
+    const isConcept = isConceptPlayer(item);
     normalized.push({
       ...item,
       rating,
@@ -508,6 +513,8 @@ const normalizePlayers = (players) => {
       isTots,
       isTotwOrTots: isTotw || isTots,
       isEvolution,
+      isConcept,
+      concept: Boolean(item.concept || isConcept),
     });
   }
   return normalized;
@@ -599,6 +606,7 @@ export const buildSolverContext = ({
     excludeSpecial: toBooleanSetting(filters?.excludeSpecial, false),
     useTotwPlayers: toBooleanSetting(filters?.useTotwPlayers, true),
     useEvolutionPlayers: toBooleanSetting(filters?.useEvolutionPlayers, false),
+    allowConceptPlayers: toBooleanSetting(filters?.allowConceptPlayers, false),
     allowedCardBuckets: normalizeAllowedCardBuckets(
       filters?.allowedCardBuckets,
       CARD_BUCKETS,
@@ -628,6 +636,9 @@ export const buildSolverContext = ({
       if (player?.id == null) return true;
       return !excludedIds.has(String(player.id));
     });
+  }
+  if (!normalizedFilters.allowConceptPlayers) {
+    normalizedPlayers = normalizedPlayers.filter((player) => !isConceptPlayer(player));
   }
   if (!normalizedFilters.useEvolutionPlayers) {
     normalizedPlayers = normalizedPlayers.filter((player) => {
@@ -1188,9 +1199,16 @@ const getChemistryShortfall = (chemistry, targets) => {
   };
 };
 
+const getRuleValues = (rule) => {
+  if (Array.isArray(rule?.values)) return rule.values;
+  if (Array.isArray(rule?.value)) return rule.value;
+  if (rule?.value != null) return [rule.value];
+  return [];
+};
+
 const buildPredicate = (rule) => {
   if (!rule) return null;
-  const values = rule.values || [];
+  const values = getRuleValues(rule);
   const type = rule.type;
   if (type === "player_level" && isPlayerLevelQuotaRule(rule)) {
     const normalized = normalizeQualityValues(values);
@@ -3122,6 +3140,7 @@ const getSolvedSquadValueMetrics = (
     0,
   );
   const storageUsage = getStorageUsageMetrics(list);
+  const conceptUsage = getConceptUsageMetrics(list);
   const signature = options?.signature ?? null;
   const composition = buildCompositionSnapshot(list, list.length);
 
@@ -3268,6 +3287,9 @@ const getSolvedSquadValueMetrics = (
     maxRating: preservation.maxRating,
     highRatingScore: preservation.highScore,
     highRatingCount: preservation.highCount,
+    conceptCount: conceptUsage.conceptCount,
+    conceptPlayerIds: conceptUsage.conceptPlayerIds,
+    conceptDefinitionIds: conceptUsage.conceptDefinitionIds,
     identityBalancePenalty,
     specialCount: preservation.specialCount,
     storageCount: storageUsage.storageCount,
@@ -3290,6 +3312,8 @@ const isSolvedSquadValueBetter = (candidate, current) => {
     return candidate.excessInformCount < current.excessInformCount;
   if (candidate.excessSpecialCount !== current.excessSpecialCount)
     return candidate.excessSpecialCount < current.excessSpecialCount;
+  if (candidate.conceptCount !== current.conceptCount)
+    return candidate.conceptCount < current.conceptCount;
   if (candidate.highRatingScore !== current.highRatingScore)
     return candidate.highRatingScore < current.highRatingScore;
   if (candidate.highRatingCount !== current.highRatingCount)
@@ -7008,6 +7032,17 @@ const getDominantCountEntry = (players, attr) => {
   return { value, count, counts };
 };
 
+const serializeCountsMap = (counts, limit = 12) =>
+  Object.fromEntries(
+    Array.from(counts?.entries?.() || [])
+      .sort((a, b) => {
+        if (b[1] !== a[1]) return b[1] - a[1];
+        return String(a[0]).localeCompare(String(b[0]));
+      })
+      .slice(0, limit)
+      .map(([key, value]) => [String(key), value]),
+  );
+
 const isRareNonSpecialPlayer = (player) => {
   if (!player || player.isSpecial) return false;
   const rarity = normalizeString(player?.rarityName);
@@ -7048,6 +7083,9 @@ const buildCompositionSnapshot = (players, squadSize = null) => {
     uniqueLeagues: leagues.counts.size,
     uniqueNations: nations.counts.size,
     uniqueClubs: clubs.counts.size,
+    leagueCounts: serializeCountsMap(leagues.counts),
+    nationCounts: serializeCountsMap(nations.counts),
+    clubCounts: serializeCountsMap(clubs.counts),
     dominantLeague: leagues.value,
     dominantLeagueCount: leagues.count,
     dominantNation: nations.value,
@@ -7055,6 +7093,11 @@ const buildCompositionSnapshot = (players, squadSize = null) => {
     dominantClub: clubs.value,
     dominantClubCount: clubs.count,
     specialCount: squad.filter((player) => Boolean(player?.isSpecial)).length,
+    totwTotsCount: squad.filter((player) => Boolean(player?.isTotwOrTots))
+      .length,
+    nonTotwSpecialCount: squad.filter(
+      (player) => Boolean(player?.isSpecial) && !player?.isTotwOrTots,
+    ).length,
     rareCount: squad.filter((player) => isRareNonSpecialPlayer(player)).length,
     ...storageUsage,
   };
@@ -7197,7 +7240,7 @@ const buildChallengeSignature = (rules, squadSize) => {
           required,
         );
       }
-      for (const value of rule.values || []) {
+      for (const value of getRuleValues(rule)) {
         const numeric = toNumber(value);
         if (numeric != null) requiredLeagueIds.add(numeric);
       }
@@ -7210,7 +7253,7 @@ const buildChallengeSignature = (rules, squadSize) => {
           required,
         );
       }
-      for (const value of rule.values || []) {
+      for (const value of getRuleValues(rule)) {
         const numeric = toNumber(value);
         if (numeric != null) requiredNationIds.add(numeric);
       }
@@ -7223,7 +7266,7 @@ const buildChallengeSignature = (rules, squadSize) => {
           required,
         );
       }
-      for (const value of rule.values || []) {
+      for (const value of getRuleValues(rule)) {
         const numeric = toNumber(value);
         if (numeric != null) requiredClubIds.add(numeric);
       }
@@ -7350,7 +7393,7 @@ const classifyHighChemShape = (signature, rules, squadSize, context = {}) => {
       return false;
     const required = getRuleCount(rule, size);
     if (required == null || required <= 0) return false;
-    const values = (rule.values || []).map((value) =>
+    const values = getRuleValues(rule).map((value) =>
       normalizeString(String(value)),
     );
     return values.some((value) => value.includes("gold"));
@@ -9372,6 +9415,872 @@ const compareSolverResult = (validSquad, solverResult) => ({
   failingRequirements: solverResult?.failingRequirements ?? [],
 });
 
+const summarizeScopeSettings = (filters = {}) => ({
+  ratingMin: toNumber(filters?.ratingMin) ?? null,
+  ratingMax: toNumber(filters?.ratingMax) ?? null,
+  allowedCardBuckets: normalizeAllowedCardBuckets(
+    filters?.allowedCardBuckets,
+    CARD_BUCKETS,
+  ),
+  excludeSpecial: toBooleanSetting(filters?.excludeSpecial, false),
+  useTotwPlayers: toBooleanSetting(filters?.useTotwPlayers, true),
+  useEvolutionPlayers: toBooleanSetting(filters?.useEvolutionPlayers, false),
+  allowConceptPlayers: toBooleanSetting(filters?.allowConceptPlayers, false),
+  onlyStorage: toBooleanSetting(filters?.onlyStorage, false),
+  onlyUntradeables: toBooleanSetting(filters?.onlyUntradeables, false),
+  onlyDuplicates: toBooleanSetting(filters?.onlyDuplicates, false),
+  useUnassigned: toBooleanSetting(filters?.useUnassigned, false),
+  excludedLeagueIds: Array.isArray(filters?.excludedLeagueIds)
+    ? filters.excludedLeagueIds.slice()
+    : [],
+  excludedNationIds: Array.isArray(filters?.excludedNationIds)
+    ? filters.excludedNationIds.slice()
+    : [],
+  excludedPlayerIds: Array.isArray(filters?.excludedPlayerIds)
+    ? filters.excludedPlayerIds.slice()
+    : [],
+});
+
+const summarizeScopeSignature = (signature = {}) => ({
+  hasChemistry: Boolean(signature?.hasChemistry),
+  totalChemistryTarget: signature?.totalChemistryTarget ?? null,
+  minPlayerChemistryTarget: signature?.minPlayerChemistryTarget ?? null,
+  ratingTarget: signature?.ratingTarget ?? null,
+  nationCountMin: signature?.nationCountMin ?? null,
+  nationCountMax: signature?.nationCountMax ?? null,
+  leagueCountMin: signature?.leagueCountMin ?? null,
+  leagueCountMax: signature?.leagueCountMax ?? null,
+  clubCountMin: signature?.clubCountMin ?? null,
+  clubCountMax: signature?.clubCountMax ?? null,
+  sameLeagueMin: signature?.sameLeagueMin ?? null,
+  sameNationMin: signature?.sameNationMin ?? null,
+  sameClubMin: signature?.sameClubMin ?? null,
+  sameLeagueMax: signature?.sameLeagueMax ?? null,
+  sameNationMax: signature?.sameNationMax ?? null,
+  sameClubMax: signature?.sameClubMax ?? null,
+  requiredLeagueIds: Array.isArray(signature?.requiredLeagueIds)
+    ? signature.requiredLeagueIds.slice()
+    : [],
+  requiredNationIds: Array.isArray(signature?.requiredNationIds)
+    ? signature.requiredNationIds.slice()
+    : [],
+  requiredClubIds: Array.isArray(signature?.requiredClubIds)
+    ? signature.requiredClubIds.slice()
+    : [],
+  requiredLeagueTarget: signature?.requiredLeagueTarget ?? null,
+  requiredNationTarget: signature?.requiredNationTarget ?? null,
+  requiredClubTarget: signature?.requiredClubTarget ?? null,
+  hasRareRequirement: Boolean(signature?.hasRareRequirement),
+  rareTarget: signature?.rareTarget ?? null,
+  hasInformRequirement: Boolean(signature?.hasInformRequirement),
+  dominantAxes: Array.isArray(signature?.dominantAxes)
+    ? signature.dominantAxes.slice()
+    : [],
+});
+
+const getChallengeShape = (signature, failingTypes = []) => {
+  const shapes = new Set();
+  const failing = new Set(failingTypes || []);
+  if (signature?.ratingTarget != null || failing.has("team_rating")) {
+    shapes.add("rating");
+  }
+  if (signature?.hasChemistry || failing.has("chemistry_points")) {
+    shapes.add("chemistry");
+  }
+  if (
+    signature?.nationCountMin != null ||
+    signature?.nationCountMax != null ||
+    signature?.leagueCountMin != null ||
+    signature?.leagueCountMax != null ||
+    signature?.clubCountMin != null ||
+    signature?.clubCountMax != null ||
+    failing.has("nation_count") ||
+    failing.has("league_count") ||
+    failing.has("club_count")
+  ) {
+    shapes.add("composition");
+  }
+  if (
+    signature?.requiredLeagueIds?.length ||
+    signature?.requiredNationIds?.length ||
+    signature?.requiredClubIds?.length ||
+    failing.has("league_id") ||
+    failing.has("nation_id") ||
+    failing.has("club_id")
+  ) {
+    shapes.add("identity");
+  }
+  if (failing.has("player_level") || failing.has("player_quality")) {
+    shapes.add("quality");
+  }
+  if (
+    signature?.hasRareRequirement ||
+    signature?.hasInformRequirement ||
+    failing.has("player_rarity") ||
+    failing.has("player_rarity_group") ||
+    failing.has("player_totw_or_tots") ||
+    failing.has("player_tots") ||
+    failing.has("player_inform") ||
+    failing.has("player_rarity_or_totw")
+  ) {
+    shapes.add("special_or_rarity");
+  }
+  if (!shapes.size) return "baseline";
+  return shapes.size === 1 ? Array.from(shapes)[0] : "mixed";
+};
+
+const getScopeFailureShape = (shortcomings = [], solved = false) => {
+  if (solved) return null;
+  const reasons = new Set(
+    (shortcomings || []).map((entry) => entry?.reason).filter(Boolean),
+  );
+  if (Array.from(reasons).some((reason) => reason?.includes("settings"))) {
+    return "settings_conflict";
+  }
+  if (reasons.has("pool_exhaustion")) return "pool_exhaustion";
+  if (reasons.has("rating_shortfall")) return "rating_shortfall";
+  if (reasons.has("chemistry_shortfall")) return "chemistry_shortfall";
+  if (Array.from(reasons).some((reason) => reason?.includes("identity"))) {
+    return "identity_shortfall";
+  }
+  if (Array.from(reasons).some((reason) => reason?.includes("quality"))) {
+    return "quality/card-type_shortfall";
+  }
+  if (Array.from(reasons).some((reason) => reason?.includes("rarity"))) {
+    return "rarity_shortfall";
+  }
+  return shortcomings?.length ? "unsatisfied_requirements" : "unknown";
+};
+
+const summarizeScopeFailingRequirement = (entry) => ({
+  type: normalizeRequirementType(entry),
+  label: entry?.label ?? entry?.raw?.label ?? null,
+  required: entry?.required ?? entry?.target ?? entry?.count ?? null,
+  actual: entry?.actual ?? entry?.current ?? entry?.value ?? null,
+});
+
+const buildScopeWeakSlots = (squad, slots, chemistry, squadSize) => {
+  const list = Array.isArray(squad) ? squad : [];
+  const n = Math.min(toNumber(squadSize) ?? list.length, list.length);
+  const perSlotChem = Array.isArray(chemistry?.perSlotChem)
+    ? chemistry.perSlotChem
+    : [];
+  const onPosition = Array.isArray(chemistry?.onPosition)
+    ? chemistry.onPosition
+    : [];
+  const slotList = Array.isArray(slots) ? slots : [];
+  return list
+    .slice(0, n)
+    .map((player, index) => ({
+      index,
+      slotIndex: slotList[index]?.slotIndex ?? null,
+      position:
+        slotList[index]?.positionName ??
+        slotList[index]?.position ??
+        player?.preferredPositionName ??
+        player?.preferredPositionId ??
+        null,
+      playerId: player?.id ?? null,
+      rating: toNumber(player?.rating) ?? null,
+      chemistry: toNumber(perSlotChem[index]) ?? null,
+      onPosition:
+        onPosition[index] == null ? null : Boolean(onPosition[index]),
+      leagueId: player?.leagueId ?? null,
+      nationId: player?.nationId ?? null,
+      teamId: player?.teamId ?? null,
+      cardBucket: getBaseCardBucket(player),
+      isSpecial: Boolean(player?.isSpecial),
+    }))
+    .filter((slot) => slot.chemistry == null || slot.chemistry < 3 || !slot.onPosition)
+    .sort((a, b) => {
+      const chemA = toNumber(a.chemistry) ?? 99;
+      const chemB = toNumber(b.chemistry) ?? 99;
+      if (chemA !== chemB) return chemA - chemB;
+      return Number(a.onPosition === true) - Number(b.onPosition === true);
+    })
+    .slice(0, 5);
+};
+
+const getSnapshotAxisCount = (snapshot, axis, id) => {
+  if (id == null) return 0;
+  const key = String(id);
+  if (axis === "league") {
+    return toNumber(snapshot?.leagueCounts?.[key]) ?? 0;
+  }
+  if (axis === "nation") {
+    return toNumber(snapshot?.nationCounts?.[key]) ?? 0;
+  }
+  if (axis === "club") {
+    return toNumber(snapshot?.clubCounts?.[key]) ?? 0;
+  }
+  return 0;
+};
+
+const getSameAxisMax = (signature, axis) => {
+  if (axis === "league") return toNumber(signature?.sameLeagueMax);
+  if (axis === "nation") return toNumber(signature?.sameNationMax);
+  if (axis === "club") return toNumber(signature?.sameClubMax);
+  return null;
+};
+
+const getSameAxisMin = (signature, axis) => {
+  if (axis === "league") return toNumber(signature?.sameLeagueMin);
+  if (axis === "nation") return toNumber(signature?.sameNationMin);
+  if (axis === "club") return toNumber(signature?.sameClubMin);
+  return null;
+};
+
+const getUniqueAxisMax = (signature, axis) => {
+  if (axis === "league") return toNumber(signature?.leagueCountMax);
+  if (axis === "nation") return toNumber(signature?.nationCountMax);
+  if (axis === "club") return toNumber(signature?.clubCountMax);
+  return null;
+};
+
+const getSnapshotUniqueAxisCount = (snapshot, axis) => {
+  if (axis === "league") return toNumber(snapshot?.uniqueLeagues) ?? 0;
+  if (axis === "nation") return toNumber(snapshot?.uniqueNations) ?? 0;
+  if (axis === "club") return toNumber(snapshot?.uniqueClubs) ?? 0;
+  return 0;
+};
+
+const getSnapshotAxisIds = (snapshot, axis) => {
+  const counts =
+    axis === "league"
+      ? snapshot?.leagueCounts
+      : axis === "nation"
+        ? snapshot?.nationCounts
+        : axis === "club"
+          ? snapshot?.clubCounts
+          : null;
+  return Object.keys(counts || {})
+    .map((id) => toNumber(id))
+    .filter((id) => id != null)
+    .sort((a, b) => a - b);
+};
+
+const getSlotAxisId = (slot, axis) => {
+  if (axis === "league") return slot?.leagueId ?? null;
+  if (axis === "nation") return slot?.nationId ?? null;
+  if (axis === "club") return slot?.teamId ?? null;
+  return null;
+};
+
+const buildScopeAxisPreference = (axis, id, slot, snapshot, signature) => {
+  const entry = { axis, id };
+  if (signature?.dominantAxes?.includes?.(axis)) {
+    entry.priority = "primary";
+    entry.reason =
+      getSameAxisMin(signature, axis) != null
+        ? `same_${axis}_min`
+        : "dominant_axis";
+  }
+  const max = getSameAxisMax(signature, axis);
+  if (max != null) {
+    const current = getSnapshotAxisCount(snapshot, axis, id);
+    const slotAxisId = getSlotAxisId(slot, axis);
+    if (current >= max && String(slotAxisId) !== String(id)) {
+      entry.status = "capped";
+      entry.current = current;
+      entry.max = max;
+    }
+  }
+  return entry;
+};
+
+const sortScopeAxisPreferences = (entries) =>
+  entries.slice().sort((a, b) => {
+    const priorityScore = (entry) => (entry?.priority === "primary" ? 0 : 1);
+    const byPriority = priorityScore(a) - priorityScore(b);
+    if (byPriority !== 0) return byPriority;
+    const axisOrder = { league: 0, nation: 1, club: 2 };
+    return (axisOrder[a?.axis] ?? 99) - (axisOrder[b?.axis] ?? 99);
+  });
+
+const getRequiredAxisConfig = (signature, axis) => {
+  if (axis === "league") {
+    return {
+      ids: signature?.requiredLeagueIds || [],
+      target: signature?.requiredLeagueTarget,
+      reason: "required_league",
+    };
+  }
+  if (axis === "nation") {
+    return {
+      ids: signature?.requiredNationIds || [],
+      target: signature?.requiredNationTarget,
+      reason: "required_nation",
+    };
+  }
+  if (axis === "club") {
+    return {
+      ids: signature?.requiredClubIds || [],
+      target: signature?.requiredClubTarget,
+      reason: "required_club",
+    };
+  }
+  return { ids: [], target: null, reason: null };
+};
+
+const buildScopePreserveAxes = (slot, snapshot, signature) => {
+  const preserve = [];
+  for (const axis of ["league", "nation", "club"]) {
+    const { ids, target, reason } = getRequiredAxisConfig(signature, axis);
+    const id = getSlotAxisId(slot, axis);
+    if (id == null) continue;
+    if (ids?.includes?.(id)) {
+      const requiredTarget = Math.max(toNumber(target) ?? 1, 1);
+      const current = ids.reduce(
+        (sum, nextId) => sum + getSnapshotAxisCount(snapshot, axis, nextId),
+        0,
+      );
+      if (current <= requiredTarget) {
+        preserve.push({ axis, id, reason, current, target: requiredTarget });
+      }
+    }
+    const sameAxisMin = getSameAxisMin(signature, axis);
+    const slotAxisCount = getSnapshotAxisCount(snapshot, axis, id);
+    if (
+      sameAxisMin != null &&
+      slotAxisCount >= sameAxisMin &&
+      slotAxisCount <= sameAxisMin
+    ) {
+      preserve.push({
+        axis,
+        id,
+        reason: `same_${axis}_min`,
+        current: slotAxisCount,
+        target: sameAxisMin,
+      });
+    }
+  }
+  return preserve;
+};
+
+const buildScopeLocks = (snapshot, signature) => {
+  const locks = [];
+  for (const axis of ["league", "nation", "club"]) {
+    const max = getUniqueAxisMax(signature, axis);
+    if (max == null) continue;
+    const current = getSnapshotUniqueAxisCount(snapshot, axis);
+    if (current >= max) {
+      locks.push({
+        axis,
+        reason: "unique_axis_max",
+        current,
+        max,
+        allowedIds: getSnapshotAxisIds(snapshot, axis),
+      });
+    }
+  }
+  return locks;
+};
+
+const buildRequiredScopeRequirement = (axis, snapshot, signature) => {
+  const { ids, target, reason } = getRequiredAxisConfig(signature, axis);
+  if (!ids?.length) return null;
+  const requiredTarget = Math.max(toNumber(target) ?? 1, 1);
+  const satisfiedBy = ids
+    .map((id) => ({ id, count: getSnapshotAxisCount(snapshot, axis, id) }))
+    .filter((entry) => entry.count > 0);
+  const current = satisfiedBy.reduce((sum, entry) => sum + entry.count, 0);
+  return {
+    axis,
+    rule: reason,
+    ids: ids.slice(),
+    target: requiredTarget,
+    current,
+    status: current >= requiredTarget ? "satisfied" : "unsatisfied",
+    margin: current - requiredTarget,
+    satisfiedBy,
+  };
+};
+
+const buildSameAxisScopeRequirement = (axis, snapshot, signature) => {
+  const target = getSameAxisMin(signature, axis);
+  if (target == null) return null;
+  const counts =
+    axis === "league"
+      ? snapshot?.leagueCounts
+      : axis === "nation"
+        ? snapshot?.nationCounts
+        : axis === "club"
+          ? snapshot?.clubCounts
+          : null;
+  const satisfiedBy = Object.entries(counts || {})
+    .map(([id, count]) => ({ id: toNumber(id), count: toNumber(count) ?? 0 }))
+    .filter((entry) => entry.id != null && entry.count >= target)
+    .sort((a, b) => b.count - a.count || a.id - b.id);
+  const current = satisfiedBy[0]?.count ?? 0;
+  return {
+    axis,
+    rule: `same_${axis}_min`,
+    ids: satisfiedBy.map((entry) => entry.id),
+    target,
+    current,
+    status: current >= target ? "satisfied" : "unsatisfied",
+    margin: current - target,
+    satisfiedBy,
+  };
+};
+
+const buildScopeRequirements = (snapshot, signature) =>
+  [
+    ...["league", "nation", "club"].map((axis) =>
+      buildRequiredScopeRequirement(axis, snapshot, signature),
+    ),
+    ...["league", "nation", "club"].map((axis) =>
+      buildSameAxisScopeRequirement(axis, snapshot, signature),
+    ),
+  ].filter(Boolean);
+
+const buildScopeConstrainedAxes = (axisPreference, scopeLocks) => {
+  const preferredByAxis = new Map(
+    (axisPreference || [])
+      .filter((entry) => entry?.axis)
+      .map((entry) => [entry.axis, entry]),
+  );
+  return (scopeLocks || []).map((lock) => {
+    const preferred = preferredByAxis.get(lock.axis);
+    return {
+      axis: lock.axis,
+      reason: lock.reason,
+      allowedIds: Array.isArray(lock.allowedIds) ? lock.allowedIds.slice() : [],
+      preferredId: preferred?.id ?? null,
+      preferredPriority: preferred?.priority ?? null,
+    };
+  });
+};
+
+const QUALITY_RATING_BANDS = {
+  bronze: { min: 0, max: 64 },
+  silver: { min: 65, max: 74 },
+  gold: { min: 75, max: 99 },
+};
+
+const getScopeQualityFromRequirement = (entry) => {
+  const candidates = [
+    ...getRuleValues(entry),
+    entry?.quality,
+    entry?.value,
+    entry?.label,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeString(String(candidate ?? ""));
+    if (normalized.includes("bronze")) return "bronze";
+    if (normalized.includes("silver")) return "silver";
+    if (normalized.includes("gold")) return "gold";
+  }
+  return null;
+};
+
+const getScopeQualityBlockers = (quality, settings) => {
+  const blockers = [];
+  const band = QUALITY_RATING_BANDS[quality];
+  const ratingMin = toNumber(settings?.ratingMin);
+  const ratingMax = toNumber(settings?.ratingMax);
+  if (band) {
+    if (ratingMax != null && ratingMax < band.min) {
+      blockers.push(`rating_max_below_${quality}`);
+    }
+    if (ratingMin != null && ratingMin > band.max) {
+      blockers.push(`rating_min_above_${quality}`);
+    }
+  }
+  const allowedBuckets = new Set(settings?.allowedCardBuckets || []);
+  if (
+    quality &&
+    !allowedBuckets.has(`common_${quality}`) &&
+    !allowedBuckets.has(`rare_${quality}`)
+  ) {
+    blockers.push(`${quality}_base_cards_disabled`);
+  }
+  return blockers;
+};
+
+const buildScopeSearchHints = ({
+  shortcomings,
+  weakSlots,
+  snapshot,
+  signature,
+  stats,
+  settings,
+  scopeLocks,
+}) => {
+  const hints = [];
+  const allowedBuckets = new Set(settings?.allowedCardBuckets || []);
+  const baseCardBlockers = [];
+  if (!allowedBuckets.has("common_gold") && !allowedBuckets.has("rare_gold")) {
+    baseCardBlockers.push("gold_base_cards_disabled");
+  }
+  if (
+    !allowedBuckets.has("rare_bronze") &&
+    !allowedBuckets.has("rare_silver") &&
+    !allowedBuckets.has("rare_gold")
+  ) {
+    baseCardBlockers.push("rare_base_cards_disabled");
+  }
+  const specialBlockers = settings?.excludeSpecial
+    ? ["non_totw_special_cards_disabled"]
+    : [];
+  const totwTotsBlockers = !settings?.useTotwPlayers
+    ? ["totw_tots_disabled"]
+    : [];
+  const blockersForHint = (requiredAxes = [], options = {}) => {
+    if (requiredAxes.includes("player_totw_or_tots")) {
+      return [...baseCardBlockers, ...totwTotsBlockers];
+    }
+    if (options.includeSpecialBlockers) {
+      return [...baseCardBlockers, ...specialBlockers, ...totwTotsBlockers];
+    }
+    return [...baseCardBlockers];
+  };
+
+  const ratingTarget = toNumber(signature?.ratingTarget);
+  const squadRating = toNumber(stats?.squadRating);
+  if (ratingTarget != null && squadRating != null && squadRating < ratingTarget) {
+    const requiredAxes = signature?.hasInformRequirement
+      ? ["player_totw_or_tots"]
+      : [];
+    hints.push({
+      reason: "rating_shortfall",
+      ratingBand: {
+        min: Math.max(0, ratingTarget),
+        max: Math.min(99, Math.max(ratingTarget + 3, squadRating + 5)),
+      },
+      requiredAxes,
+      blockedBySettings: blockersForHint(requiredAxes, {
+        includeSpecialBlockers: !requiredAxes.length,
+      }),
+    });
+  }
+
+  for (const shortcoming of shortcomings || []) {
+    if (shortcoming?.reason !== "quality_shortfall") continue;
+    const quality = shortcoming?.evidence?.quality ?? null;
+    const band = quality ? QUALITY_RATING_BANDS[quality] : null;
+    hints.push({
+      reason: "quality_shortfall",
+      quality,
+      missing: shortcoming?.evidence?.missing ?? null,
+      ratingBand: band ? { ...band } : null,
+      blockedBySettings: getScopeQualityBlockers(quality, settings),
+    });
+  }
+
+  if (signature?.hasChemistry) {
+    for (const slot of weakSlots || []) {
+      const axisPreference = [];
+      if (snapshot?.dominantLeague != null) {
+        axisPreference.push(
+          buildScopeAxisPreference(
+            "league",
+            snapshot.dominantLeague,
+            slot,
+            snapshot,
+            signature,
+          ),
+        );
+      }
+      if (snapshot?.dominantNation != null) {
+        axisPreference.push(
+          buildScopeAxisPreference(
+            "nation",
+            snapshot.dominantNation,
+            slot,
+            snapshot,
+            signature,
+          ),
+        );
+      }
+      if (
+        snapshot?.dominantClub != null &&
+        (toNumber(snapshot?.dominantClubCount) ?? 0) >= 2
+      ) {
+        axisPreference.push(
+          buildScopeAxisPreference(
+            "club",
+            snapshot.dominantClub,
+            slot,
+            snapshot,
+            signature,
+          ),
+        );
+      }
+      const preserveAxes = buildScopePreserveAxes(slot, snapshot, signature);
+      const sortedAxisPreference = sortScopeAxisPreferences(axisPreference);
+      hints.push({
+        reason: "weak_slot_chemistry",
+        slotIndex: slot.slotIndex,
+        position: slot.position,
+        axisPreference: sortedAxisPreference,
+        constrainedAxes: buildScopeConstrainedAxes(
+          sortedAxisPreference,
+          scopeLocks,
+        ),
+        preserveAxes,
+        ratingBand: {
+          min: Math.max(0, (toNumber(slot.rating) ?? 75) - 2),
+          max: Math.min(99, (toNumber(slot.rating) ?? 75) + 6),
+        },
+        blockedBySettings: blockersForHint(),
+      });
+    }
+  }
+
+  for (const shortcoming of shortcomings || []) {
+    if (shortcoming?.reason !== "rarity_shortfall") continue;
+    hints.push({
+      reason: "rarity_shortfall",
+      rarity: "rare",
+      missing: shortcoming?.evidence?.missing ?? null,
+      blockedBySettings: baseCardBlockers.filter(
+        (blocker) => blocker === "rare_base_cards_disabled",
+      ),
+    });
+  }
+  return hints.slice(0, 8);
+};
+
+const buildScopeAnalysis = ({
+  context,
+  signature,
+  failingRequirements,
+  squad,
+  squadSize,
+  chemistry,
+  slotsForChemistry,
+  stats,
+  compositionSnapshot,
+  rules,
+}) => {
+  const failing = Array.isArray(failingRequirements)
+    ? failingRequirements.map(summarizeScopeFailingRequirement)
+    : [];
+  for (const entry of failing) {
+    if (entry?.type === "team_rating") {
+      entry.required = toNumber(signature?.ratingTarget) ?? entry.required;
+      entry.actual = toNumber(stats?.squadRating) ?? entry.actual;
+    }
+    if (entry?.type === "chemistry_points") {
+      entry.required =
+        toNumber(signature?.totalChemistryTarget) ?? entry.required;
+      entry.actual = toNumber(stats?.chemistry?.totalChem) ?? entry.actual;
+    }
+    if (entry?.type === "all_players_chemistry_points") {
+      entry.required =
+        toNumber(signature?.minPlayerChemistryTarget) ?? entry.required;
+      entry.actual = toNumber(stats?.chemistry?.minChem) ?? entry.actual;
+    }
+  }
+  const failingTypes = Array.from(
+    new Set(failing.map((entry) => entry.type).filter(Boolean)),
+  );
+  const settings = summarizeScopeSettings(context?.filters || {});
+  const signatureSummary = summarizeScopeSignature(signature);
+  const snapshot =
+    compositionSnapshot || buildCompositionSnapshot(squad || [], squadSize);
+  const weakSlots = signature?.hasChemistry
+    ? buildScopeWeakSlots(squad, slotsForChemistry, chemistry, squadSize)
+    : [];
+  const shortcomings = [];
+  const reasoning = [];
+  const solved = Boolean(stats?.solved);
+  const ratingTarget = toNumber(signature?.ratingTarget);
+  const squadRating = toNumber(stats?.squadRating);
+  if (ratingTarget != null && squadRating != null && squadRating < ratingTarget) {
+    const missing = ratingTarget - squadRating;
+    shortcomings.push({
+      code: `rating_below_target_${missing}`,
+      reason: "rating_shortfall",
+      evidence: { current: squadRating, target: ratingTarget, missing },
+    });
+    reasoning.push({
+      reason: "rating_shortfall",
+      evidence: { current: squadRating, target: ratingTarget },
+      affectedSlots: [],
+      preferredAxes: [],
+    });
+  }
+
+  const totalTarget = toNumber(signature?.totalChemistryTarget);
+  const totalChem = toNumber(stats?.chemistry?.totalChem);
+  if (totalTarget != null && totalChem != null && totalChem < totalTarget) {
+    const missing = totalTarget - totalChem;
+    const affectedSlots = weakSlots
+      .filter((slot) => (toNumber(slot.chemistry) ?? 0) < 3)
+      .map((slot) => slot.index);
+    shortcomings.push({
+      code: `chemistry_missing_${missing}`,
+      reason: "chemistry_shortfall",
+      evidence: { current: totalChem, target: totalTarget, missing },
+    });
+    reasoning.push({
+      reason: "chemistry_shortfall",
+      evidence: { current: totalChem, target: totalTarget },
+      affectedSlots,
+      preferredAxes: signature?.dominantAxes?.length
+        ? signature.dominantAxes.slice()
+        : ["league", "nation"],
+    });
+  }
+
+  if (signature?.hasRareRequirement) {
+    const rareTarget = toNumber(signature?.rareTarget);
+    const rareCount = toNumber(snapshot?.rareCount);
+    if (rareTarget != null && rareCount != null && rareCount < rareTarget) {
+      const missing = rareTarget - rareCount;
+      shortcomings.push({
+        code: `rare_shortfall_${missing}`,
+        reason: "rarity_shortfall",
+        evidence: { current: rareCount, target: rareTarget, missing },
+      });
+      reasoning.push({
+        reason: "rarity_shortfall",
+        evidence: { current: rareCount, target: rareTarget },
+        affectedSlots: [],
+        preferredAxes: [],
+      });
+    }
+  }
+
+  const filteredPlayerCount = toNumber(stats?.filteredPlayerCount) ?? 0;
+  if (filteredPlayerCount < (toNumber(squadSize) ?? 0)) {
+    shortcomings.push({
+      code: "pool_exhaustion",
+      reason: "pool_exhaustion",
+      evidence: { filteredPlayerCount, squadSize },
+    });
+  }
+
+  const allowedBuckets = new Set(settings.allowedCardBuckets || []);
+  const hasGoldRule = (rules || []).some((rule) => {
+    const type = normalizeRequirementType(rule);
+    const label = normalizeString(rule?.label || rule?.raw?.label);
+    return type === "player_level" && label?.includes("gold");
+  });
+  if (
+    hasGoldRule &&
+    !allowedBuckets.has("common_gold") &&
+    !allowedBuckets.has("rare_gold")
+  ) {
+    shortcomings.push({
+      code: "no_allowed_gold_pool",
+      reason: "settings_conflict_quality",
+      evidence: { allowedCardBuckets: settings.allowedCardBuckets },
+    });
+  }
+  if (
+    signature?.hasRareRequirement &&
+    !allowedBuckets.has("rare_bronze") &&
+    !allowedBuckets.has("rare_silver") &&
+    !allowedBuckets.has("rare_gold")
+  ) {
+    shortcomings.push({
+      code: "rare_base_cards_disabled",
+      reason: "settings_conflict_rarity",
+      evidence: { allowedCardBuckets: settings.allowedCardBuckets },
+    });
+  }
+
+  for (const entry of failing) {
+    if (!entry.type) continue;
+    if (entry.type === "team_rating" || entry.type === "chemistry_points") {
+      continue;
+    }
+    const quality =
+      entry.type?.includes("level") || entry.type?.includes("quality")
+        ? getScopeQualityFromRequirement(entry)
+        : null;
+    const reason = entry.type?.includes("rarity")
+      ? "rarity_shortfall"
+      : entry.type?.includes("level") || entry.type?.includes("quality")
+        ? "quality_shortfall"
+        : entry.type?.includes("club") ||
+            entry.type?.includes("league") ||
+            entry.type?.includes("nation")
+          ? "identity_or_composition_shortfall"
+          : "requirement_shortfall";
+    const evidence = quality
+      ? {
+          ...entry,
+          quality,
+          missing: toNumber(entry?.required) ?? null,
+        }
+      : entry;
+    shortcomings.push({
+      code: `${entry.type}_unsatisfied`,
+      reason,
+      evidence,
+    });
+    if (quality) {
+      const blockers = getScopeQualityBlockers(quality, settings);
+      const band = QUALITY_RATING_BANDS[quality];
+      for (const blocker of blockers) {
+        shortcomings.push({
+          code:
+            blocker === `rating_max_below_${quality}`
+              ? `${quality}_requirement_blocked_by_rating_max`
+              : blocker === `rating_min_above_${quality}`
+                ? `${quality}_requirement_blocked_by_rating_min`
+                : blocker,
+          reason: "settings_conflict_quality",
+          evidence: {
+            quality,
+            ratingMin: settings.ratingMin,
+            ratingMax: settings.ratingMax,
+            ratingBand: band ? { ...band } : null,
+            allowedCardBuckets: settings.allowedCardBuckets,
+          },
+        });
+      }
+    }
+  }
+
+  const challengeShape = getChallengeShape(signature, failingTypes);
+  const failureShape = getScopeFailureShape(shortcomings, solved);
+  const conceptSearchEligible = !solved && shortcomings.length > 0;
+  const scopeLocks = buildScopeLocks(snapshot, signature);
+  const scopeRequirements = buildScopeRequirements(snapshot, signature);
+  const searchHints = buildScopeSearchHints({
+    shortcomings,
+    weakSlots,
+    snapshot,
+    signature,
+    stats,
+    settings,
+    scopeLocks,
+  });
+
+  return {
+    challengeShape,
+    failureShape,
+    conceptSearchEligible,
+    scopeLocks,
+    scopeRequirements,
+    inputs: {
+      signature: signatureSummary,
+      failingTypes,
+      failingRequirements: failing,
+      pool: {
+        playerCount: toNumber(stats?.playerCount) ?? null,
+        filteredPlayerCount: toNumber(stats?.filteredPlayerCount) ?? null,
+        squadSize: toNumber(squadSize) ?? null,
+      },
+      solverSettings: settings,
+      chemistry: stats?.chemistry ?? null,
+      chemistryTargets: stats?.chemistryTargets ?? null,
+      squadRating: squadRating ?? null,
+      ratingTarget: ratingTarget ?? null,
+      compositionSnapshot: snapshot,
+      weakSlots,
+    },
+    shortcomings,
+    reasoning,
+    searchHints,
+  };
+};
+
 const attachOrchestrationSummary = (
   result,
   orchestration,
@@ -10966,14 +11875,14 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       const requiredNationIds = new Set(
         rules
           .filter((rule) => rule?.type === "nation_id" && rule.op === "min")
-          .flatMap((rule) => rule.values || [])
+          .flatMap((rule) => getRuleValues(rule))
           .map(toNumber)
           .filter((v) => v != null),
       );
       const requiredClubIds = new Set(
         rules
           .filter((rule) => rule?.type === "club_id" && rule.op === "min")
-          .flatMap((rule) => rule.values || [])
+          .flatMap((rule) => getRuleValues(rule))
           .map(toNumber)
           .filter((v) => v != null),
       );
@@ -11180,6 +12089,26 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
 
   timingsMs.total = Date.now() - startedAt;
   const storageUsage = getStorageUsageMetrics(squad, squadSize);
+  const conceptUsage = getConceptUsageMetrics(squad.slice(0, squadSize));
+  const conceptPlayersUsed = squad
+    .slice(0, squadSize)
+    .filter(isConceptPlayer)
+    .map((player) => ({
+      id: player?.id ?? null,
+      conceptId: player?.conceptId ?? null,
+      definitionId: player?.definitionId ?? null,
+      assetId: player?.assetId ?? null,
+      name: player?.name ?? player?.commonName ?? null,
+      rating: player?.rating ?? null,
+      position:
+        player?.preferredPositionName ??
+        player?.preferredPositionId ??
+        null,
+      leagueId: player?.leagueId ?? null,
+      nationId: player?.nationId ?? null,
+      teamId: player?.teamId ?? null,
+      rarityId: player?.rarityId ?? null,
+    }));
   const solvedValue = solved
     ? getSolvedSquadValueMetrics(
         squad,
@@ -11193,8 +12122,45 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
         },
       )
     : null;
+  const compositionSnapshot = buildCompositionSnapshot(squad, squadSize);
+  const scopeAnalysisStats = {
+    solved,
+    playerCount: normalizedPlayers.length,
+    filteredPlayerCount: pool.length,
+    squadSize,
+    squadRating: getSquadRating(squad),
+    ratingTarget: ratingRequirement?.target ?? null,
+    chemistryTargets: chemistryRequired ? chemistryTargets : null,
+    chemistry: chemistryRequired
+      ? {
+          totalChem: chemistry?.totalChem ?? null,
+          minChem: chemistry?.minChem ?? null,
+          onPositionCount: chemistry?.onPositionCount ?? null,
+      }
+      : null,
+  };
+  const shouldBuildScopeAnalysis =
+    context?.optimize?.scopeAnalysis !== false && solverDeadlineAt == null;
+  const scopeAnalysis = shouldBuildScopeAnalysis
+    ? buildScopeAnalysis({
+        context,
+        signature,
+        failingRequirements,
+        squad,
+        squadSize,
+        chemistry,
+        slotsForChemistry,
+        stats: scopeAnalysisStats,
+        compositionSnapshot,
+        rules,
+      })
+    : null;
 
   return {
+    solved,
+    submitReady: solved ? conceptUsage.conceptCount === 0 : false,
+    requiresConcepts: conceptUsage.conceptCount > 0,
+    conceptPlayersUsed,
     solutions: solved
       ? [
           slotSolution?.fieldSlotToPlayerId?.filter((id) => id != null)
@@ -11231,6 +12197,11 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
           }
         : null,
       storageUsage,
+      conceptUsage,
+      conceptCount: conceptUsage.conceptCount,
+      submitReady: solved ? conceptUsage.conceptCount === 0 : false,
+      requiresConcepts: conceptUsage.conceptCount > 0,
+      conceptPlayersUsed,
       timingsMs,
       chemistryTargets: chemistryRequired ? chemistryTargets : null,
       chemistry: chemistryRequired
@@ -11258,17 +12229,50 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
             isStorage: Boolean(player?.isStorage),
             hasStorageDuplicate: Boolean(player?.hasStorageDuplicate),
             hasClubDuplicate: Boolean(player?.hasClubDuplicate),
+            isConcept: isConceptPlayer(player),
             alternativePositionNames: player?.alternativePositionNames ?? null,
           }))
         : null,
       ignoredRequirementCount: ignoredRequirements.length,
       requirementFlags,
       constraintSummary: compiledConstraints.summary,
+      scopeAnalysis,
     },
+    _scopeSquad:
+      shouldBuildScopeAnalysis || debugEnabled
+        ? squad.slice(0, squadSize).map((player) => ({
+            id: player?.id ?? null,
+            rating: player?.rating ?? null,
+            leagueId: player?.leagueId ?? null,
+            nationId: player?.nationId ?? null,
+            teamId: player?.teamId ?? null,
+            rarityId: player?.rarityId ?? null,
+            rarityName: player?.rarityName ?? null,
+            quality: player?.quality ?? null,
+            isSpecial: Boolean(player?.isSpecial),
+            isTotwOrTots: Boolean(player?.isTotwOrTots),
+            isConcept: isConceptPlayer(player),
+            preferredPositionName: player?.preferredPositionName ?? null,
+            preferredPositionId: player?.preferredPositionId ?? null,
+            alternativePositionNames: player?.alternativePositionNames ?? null,
+          }))
+        : null,
+    _scopeSlotsForChemistry:
+      shouldBuildScopeAnalysis || debugEnabled ? slotsForChemistry : null,
+    _scopeChemistryDetails:
+      (shouldBuildScopeAnalysis || debugEnabled) && chemistry
+        ? {
+            totalChem: chemistry?.totalChem ?? null,
+            minChem: chemistry?.minChem ?? null,
+            onPositionCount: chemistry?.onPositionCount ?? null,
+            perSlotChem: chemistry?.perSlotChem ?? null,
+            onPosition: chemistry?.onPosition ?? null,
+          }
+        : null,
     seed: contextSeed,
     signature,
     phaseConfig: context?.phaseConfig ?? null,
-    compositionSnapshot: buildCompositionSnapshot(squad, squadSize),
+    compositionSnapshot,
   };
 };
 
@@ -11443,12 +12447,77 @@ export const solveSquad = (context) => {
         Date.now() < activeDeadlineAt,
     );
 
+  const withFinalScopeAnalysis = (result) => {
+    if (!result || typeof result !== "object") return result;
+    if (result?.stats?.scopeAnalysis) return result;
+    const idToPlayer = new Map(
+      normalizedPlayers
+        .filter((player) => player?.id != null)
+        .map((player) => [String(player.id), player]),
+    );
+    const solutionIds = Array.isArray(result?.solutions?.[0])
+      ? result.solutions[0]
+      : [];
+    const squad = solutionIds
+      .map((id) => idToPlayer.get(String(id)) ?? null)
+      .filter(Boolean);
+    const diagnosticSquad = squad.length
+      ? squad
+      : Array.isArray(result?._scopeSquad)
+        ? result._scopeSquad
+        : [];
+    const finalSquadSize = toNumber(result?.stats?.squadSize) ?? squadSize;
+    const slotsForChemistry = Array.isArray(result?._scopeSlotsForChemistry)
+      ? result._scopeSlotsForChemistry
+      : normalizeSlotsForChemistry(baseContext?.squadSlots, finalSquadSize);
+    const slotSolution = Array.isArray(result?.solutionSlots)
+      ? result.solutionSlots[0]
+      : null;
+    const chemistryDetails = result?._scopeChemistryDetails || null;
+    const chemistry =
+      result?.stats?.chemistry || slotSolution || chemistryDetails
+        ? {
+            ...(result?.stats?.chemistry || {}),
+            perSlotChem: Array.isArray(slotSolution?.perPlayerChem)
+              ? slotSolution.perPlayerChem
+              : chemistryDetails?.perSlotChem ?? null,
+            onPosition: Array.isArray(slotSolution?.onPosition)
+              ? slotSolution.onPosition
+              : chemistryDetails?.onPosition ?? null,
+          }
+        : null;
+    const {
+      _scopeSquad,
+      _scopeSlotsForChemistry,
+      _scopeChemistryDetails,
+      ...cleanResult
+    } = result;
+    return {
+      ...cleanResult,
+      stats: {
+        ...result.stats,
+        scopeAnalysis: buildScopeAnalysis({
+          context: baseContext,
+          signature,
+          failingRequirements: result?.failingRequirements || [],
+          squad: diagnosticSquad,
+          squadSize: finalSquadSize,
+          chemistry,
+          slotsForChemistry,
+          stats: result?.stats || {},
+          compositionSnapshot: result?.compositionSnapshot || null,
+          rules,
+        }),
+      },
+    };
+  };
+
   const finishSolvedIfEfficient = (result) => {
     if (!result?.stats?.solved) return null;
     if (shouldKeepSearchingSolved(result)) return null;
     cacheWinningSeed();
     return attachOrchestrationSummary(
-      bestResult,
+      withFinalScopeAnalysis(bestResult),
       orchestration,
       restartTimeBudgetMs,
     );
@@ -11548,7 +12617,7 @@ export const solveSquad = (context) => {
     if (shouldKeepSearchingSolved(result)) return null;
     cacheWinningSeed();
     return attachOrchestrationSummary(
-      bestResult,
+      withFinalScopeAnalysis(bestResult),
       orchestration,
       restartTimeBudgetMs,
     );
@@ -11643,7 +12712,7 @@ export const solveSquad = (context) => {
   }
   if (Date.now() >= activeDeadlineAt) {
     return attachOrchestrationSummary(
-      bestResult,
+      withFinalScopeAnalysis(bestResult),
       orchestration,
       restartTimeBudgetMs,
       Date.now() >= activeDeadlineAt,
@@ -11695,7 +12764,7 @@ export const solveSquad = (context) => {
   for (const seed of seeds) {
     if (Date.now() >= activeDeadlineAt) {
       return attachOrchestrationSummary(
-        bestResult,
+        withFinalScopeAnalysis(bestResult),
         orchestration,
         restartTimeBudgetMs,
         true,
@@ -11756,7 +12825,7 @@ export const solveSquad = (context) => {
 
   cacheWinningSeed();
   return attachOrchestrationSummary(
-    bestResult,
+    withFinalScopeAnalysis(bestResult),
     orchestration,
     restartTimeBudgetMs,
     Date.now() >= activeDeadlineAt,

@@ -2904,13 +2904,24 @@
 
   const resolveSlotValid = (slot, item) => {
     if (!slot && !item) return false;
-    if (typeof slot?.isValid === "function") return slot.isValid();
-    if (typeof slot?.getIsValid === "function") return slot.getIsValid();
+    if (typeof slot?.isValid === "function") {
+      try {
+        return slot.isValid();
+      } catch {}
+    }
+    if (typeof slot?.getIsValid === "function") {
+      try {
+        return slot.getIsValid();
+      } catch {}
+    }
     if (typeof slot?.valid === "boolean") return slot.valid;
     const concept =
-      typeof item?.isConcept === "function"
-        ? item.isConcept()
-        : Boolean(item?.concept);
+      (() => {
+        try {
+          if (typeof item?.isConcept === "function") return item.isConcept();
+        } catch {}
+        return Boolean(item?.concept);
+      })();
     return Boolean(item && item.id && item.id !== 0 && !concept);
   };
 
@@ -5624,6 +5635,7 @@
   let whatsNewAutoOpenCompleted = false;
   let whatsNewAutoOpenCheckInFlight = null;
   let loadingOverlayCount = 0;
+  let loadingOverlayDetails = [];
 
   const ensureSolveButtonStyles = () => {
     if (solveButtonStyleInjected) return;
@@ -5657,12 +5669,158 @@
       <div class="ea-data-loading-card">
         <div class="ea-data-spinner"></div>
         <div class="ea-data-loading-text">Solving squad...</div>
+        <div class="ea-data-loading-settings" aria-live="polite"></div>
       </div>
     `;
     document.body.appendChild(overlay);
   };
 
-  const setLoadingOverlayVisible = (visible, label) => {
+  const buildSolverLoadingSettingsSummary = (settings = null, poolFilters = null) => {
+    const normalized = normalizeSolverSettingsInput(settings);
+    const range = normalizeRatingRange(normalized?.ratingRange);
+    const buckets = normalizeAllowedCardBuckets(
+      normalized?.allowedCardBuckets,
+      CARD_BUCKET_KEYS,
+    );
+    const bucketByKey = new Map(CARD_BUCKETS.map((bucket) => [bucket.key, bucket]));
+    const bucketsByQuality = buckets.reduce((groups, key) => {
+      const bucket = bucketByKey.get(key) ?? null;
+      const quality = bucket?.quality ?? "other";
+      const rarity = bucket?.rarity ?? "card";
+      const list = groups.get(quality) ?? [];
+      list.push(rarity);
+      groups.set(quality, list);
+      return groups;
+    }, new Map());
+    const qualityLabels = ["bronze", "silver", "gold"].map((quality) => {
+      const rarities = bucketsByQuality.get(quality) ?? [];
+      if (!rarities.length) return null;
+      const rarityText =
+        rarities.includes("common") && rarities.includes("rare")
+          ? "common + rare"
+          : rarities.includes("common")
+            ? "common"
+            : rarities.includes("rare")
+              ? "rare"
+              : "selected";
+      return `${quality[0].toUpperCase()}${quality.slice(1)} ${rarityText}`;
+    }).filter(Boolean);
+    const toggleLabels = (SOLVER_TOGGLE_FIELDS ?? [])
+      .filter((field) => Boolean(normalized?.[field.key]))
+      .map((field) => {
+        if (field.key === "useUnassigned") return "Use unassigned";
+        if (field.key === "onlyStorage") return "Only SBC storage";
+        if (field.key === "excludeTradable") return "Protect tradables";
+        if (field.key === "excludeSpecial") return "Avoid special cards";
+        if (field.key === "useTotwPlayers") return "Allow TOTW/TOTS";
+        if (field.key === "useEvolutionPlayers") return "Allow evolutions";
+        if (field.key === "allowConceptPlayers") return "Concept fallback";
+        return field.label.replace(/\s*\(experimental\)\s*/i, "");
+      })
+      .slice(0, 6);
+    const exclusions = [
+      normalized?.excludedPlayerIds?.length
+        ? `${normalized.excludedPlayerIds.length} players`
+        : null,
+      normalized?.excludedLeagueIds?.length
+        ? `${normalized.excludedLeagueIds.length} leagues`
+        : null,
+      normalized?.excludedNationIds?.length
+        ? `${normalized.excludedNationIds.length} nations`
+        : null,
+    ].filter(Boolean);
+    const poolSize = readNumeric(poolFilters?.poolSize);
+    return [
+      {
+        type: "metric",
+        tone: "rating",
+        label: "Rating window",
+        value: `${range.ratingMin}-${range.ratingMax}`,
+      },
+      {
+        type: "metric",
+        tone: poolSize != null ? "pool" : "pending",
+        label: "Eligible owned cards",
+        value: poolSize != null ? String(poolSize) : "Checking...",
+        note: poolSize != null ? "after filters" : "fetching club data",
+      },
+      {
+        type: "group",
+        tone: "cards",
+        label: "Card types",
+        values: qualityLabels.length ? qualityLabels : ["Any card type"],
+      },
+      {
+        type: "group",
+        tone: "rules",
+        label: "Active options",
+        values: toggleLabels.length ? toggleLabels : ["Default solver rules"],
+      },
+      {
+        type: "group",
+        tone: exclusions.length ? "blocked" : "clear",
+        label: "Blocked by settings",
+        values: exclusions.length ? exclusions : ["None"],
+      },
+    ].filter(Boolean);
+  };
+
+  const renderLoadingOverlayDetails = (overlay, details = []) => {
+    const wrap = overlay?.querySelector?.(".ea-data-loading-settings");
+    if (!wrap) return;
+    const list = Array.isArray(details)
+      ? details.filter((item) => item != null && String(item).trim())
+      : [];
+    wrap.replaceChildren();
+    wrap.toggleAttribute("hidden", !list.length);
+    for (const item of list.slice(0, 6)) {
+      if (!item || typeof item !== "object") {
+        const chip = document.createElement("div");
+        chip.className = "ea-data-loading-settings__chip";
+        chip.textContent = String(item);
+        wrap.append(chip);
+        continue;
+      }
+      if (item.type === "metric") {
+        const card = document.createElement("div");
+        card.className = "ea-data-loading-settings__metric";
+        card.dataset.tone = item.tone ?? "neutral";
+        const label = document.createElement("div");
+        label.className = "ea-data-loading-settings__metric-label";
+        label.textContent = item.label ?? "";
+        const value = document.createElement("div");
+        value.className = "ea-data-loading-settings__metric-value";
+        value.textContent = item.value ?? "";
+        card.append(label, value);
+        if (item.note) {
+          const note = document.createElement("div");
+          note.className = "ea-data-loading-settings__metric-note";
+          note.textContent = item.note;
+          card.append(note);
+        }
+        wrap.append(card);
+        continue;
+      }
+      const row = document.createElement("div");
+      row.className = "ea-data-loading-settings__group";
+      row.dataset.tone = item.tone ?? "neutral";
+      const label = document.createElement("div");
+      label.className = "ea-data-loading-settings__group-label";
+      label.textContent = item.label ?? "";
+      const values = document.createElement("div");
+      values.className = "ea-data-loading-settings__group-values";
+      for (const valueText of (Array.isArray(item.values) ? item.values : []).slice(0, 5)) {
+        const value = document.createElement("span");
+        value.className = "ea-data-loading-settings__value";
+        value.textContent = String(valueText);
+        values.append(value);
+      }
+      row.append(label, values);
+      wrap.append(row);
+    }
+  };
+
+  const setLoadingOverlayVisible = (visible, label, details) => {
     ensureLoadingOverlay();
     const overlay = document.getElementById("ea-data-loading-overlay");
     if (!overlay) return;
@@ -5670,24 +5828,29 @@
       const text = overlay.querySelector(".ea-data-loading-text");
       if (text) text.textContent = label;
     }
+    if (details !== undefined) {
+      loadingOverlayDetails = Array.isArray(details) ? details.slice() : [];
+    }
+    renderLoadingOverlayDetails(overlay, loadingOverlayDetails);
     overlay.style.display = visible ? "flex" : "none";
     overlay.style.pointerEvents = visible ? "auto" : "none";
     overlay.setAttribute("aria-hidden", visible ? "false" : "true");
   };
 
-  const showLoadingOverlay = (label) => {
+  const showLoadingOverlay = (label, details) => {
     loadingOverlayCount += 1;
-    setLoadingOverlayVisible(true, label);
+    setLoadingOverlayVisible(true, label, details);
   };
 
-  const updateLoadingOverlay = (label) => {
+  const updateLoadingOverlay = (label, details) => {
     if (loadingOverlayCount <= 0) return;
-    setLoadingOverlayVisible(true, label);
+    setLoadingOverlayVisible(true, label, details);
   };
 
   const hideLoadingOverlay = () => {
     loadingOverlayCount = Math.max(0, loadingOverlayCount - 1);
     if (loadingOverlayCount === 0) {
+      loadingOverlayDetails = [];
       setLoadingOverlayVisible(false);
     }
   };
@@ -9288,6 +9451,26 @@
 
   const submitSbcChallenge = async (challenge) => {
     if (!challenge) throw new Error("Missing challenge");
+    const squadItems = Array.isArray(challenge?.squad?.getPlayers?.())
+      ? challenge.squad
+          .getPlayers()
+          .map((slot) => resolveSlotItem(slot) ?? slot ?? null)
+      : [];
+    const conceptItems = squadItems.filter((item) => {
+      const concept =
+        typeof item?.isConcept === "function"
+          ? item.isConcept()
+          : isConceptPlayerRecord(item);
+      return Boolean(concept);
+    });
+    if (conceptItems.length) {
+      const error = new Error(
+        `Cannot submit squad: ${conceptItems.length} concept player(s) are missing from club/storage.`,
+      );
+      error.code = "EA_SUBMIT_CONCEPT_PLAYERS";
+      error.conceptCount = conceptItems.length;
+      throw error;
+    }
     const setEntity = await ensureSbcSetById(challenge.setId);
     if (!setEntity) throw new Error("SBC set not found");
     if (!services?.SBC?.submitChallenge) {
@@ -10586,10 +10769,10 @@
             ...mergedFilters,
             excludedPlayerIds,
           };
-          const result = await callSolveBridge(
+          const result = await solveWithConceptFallback(
             {
+              payload,
               players: filteredPlayers,
-              _cacheRevision: payload?._cacheRevision ?? null,
               requirements: safeRequirements,
               requirementsNormalized: safeRequirementsNormalized,
               requiredPlayers: payload.requiredPlayers ?? null,
@@ -10597,8 +10780,9 @@
               prioritize: payload.prioritize,
               filters: loopFilters,
               debug: debugEnabled,
+              playerById,
+              label: "multi-generate",
             },
-            safeRequirementsNormalized,
           );
           logSolverDebugResult("multi-generate", result, {
             challengeId: startedChallengeId,
@@ -10612,6 +10796,17 @@
               title: "No More Solutions",
               message: "Unable to find more squads with current player pool.",
               timeoutMs: 9000,
+            });
+            break;
+          }
+          if (result?.requiresConcepts || result?.stats?.requiresConcepts) {
+            setStatus("");
+            showToast({
+              type: "info",
+              title: "Concept Plan Found",
+              message:
+                "A planning-only concept solution was found, so it was not added to the submit queue.",
+              timeoutMs: 10000,
             });
             break;
           }
@@ -14083,10 +14278,10 @@
               continue;
             }
 
-            const result = await callSolveBridge(
+            const result = await solveWithConceptFallback(
               {
+                payload,
                 players: filteredPlayers,
-                _cacheRevision: payload?._cacheRevision ?? null,
                 requirements: safeRequirements,
                 requirementsNormalized: safeRequirementsNormalized,
                 requiredPlayers: slotInfo.requiredPlayers ?? null,
@@ -14097,8 +14292,9 @@
                   excludedPlayerIds: Array.from(used),
                 },
                 debug: debugEnabled,
+                playerById,
+                label: "set-generate",
               },
-              safeRequirementsNormalized,
             );
             logSolverDebugResult("set-generate", result, {
               setId: startedSetId,
@@ -14108,7 +14304,10 @@
               total: filteredChallenges.length,
             });
 
-            if (result?.solutions?.length) {
+            if (
+              result?.solutions?.length &&
+              !(result?.requiresConcepts || result?.stats?.requiresConcepts)
+            ) {
               const solutionIds = result.solutions[0] ?? [];
               for (const id of solutionIds) {
                 if (id == null) continue;
@@ -14161,12 +14360,17 @@
                 : [];
               const first = failing[0] ?? null;
               const failureReason =
-                first?.label ??
-                first?.type ??
-                first?.keyNameNormalized ??
-                "No feasible squad with current player pool.";
+                result?.requiresConcepts || result?.stats?.requiresConcepts
+                  ? "Planning-only concept solution found; not queued for set submit."
+                  : first?.label ??
+                    first?.type ??
+                    first?.keyNameNormalized ??
+                    "No feasible squad with current player pool.";
               const failureMeta = buildFailureMeta({
-                source: "solver",
+                source:
+                  result?.requiresConcepts || result?.stats?.requiresConcepts
+                    ? "concept"
+                    : "solver",
                 challenge,
                 challengeName,
                 reason: failureReason,
@@ -14348,10 +14552,10 @@
               break;
             }
 
-            const result = await callSolveBridge(
+            const result = await solveWithConceptFallback(
               {
+                payload,
                 players: filteredPlayers,
-                _cacheRevision: payload?._cacheRevision ?? null,
                 requirements: safeRequirements,
                 requirementsNormalized: safeRequirementsNormalized,
                 requiredPlayers: slotInfo.requiredPlayers ?? null,
@@ -14362,8 +14566,9 @@
                   excludedPlayerIds: Array.from(workingUsed),
                 },
                 debug: debugEnabled,
+                playerById,
+                label: "set-cycle-generate",
               },
-              safeRequirementsNormalized,
             );
             logSolverDebugResult("set-cycle-generate", result, {
               setId: startedSetId,
@@ -14375,18 +14580,27 @@
               challengeTotal: filteredChallenges.length,
             });
 
-            if (!result?.solutions?.length) {
+            if (
+              !result?.solutions?.length ||
+              result?.requiresConcepts ||
+              result?.stats?.requiresConcepts
+            ) {
               const failing = Array.isArray(result?.failingRequirements)
                 ? result.failingRequirements
                 : [];
               const first = failing[0] ?? null;
               discardedReason =
-                first?.label ??
-                first?.type ??
-                first?.keyNameNormalized ??
-                "No feasible squad with current player pool.";
+                result?.requiresConcepts || result?.stats?.requiresConcepts
+                  ? "Planning-only concept solution found; not queued for set submit."
+                  : first?.label ??
+                    first?.type ??
+                    first?.keyNameNormalized ??
+                    "No feasible squad with current player pool.";
               const failureMeta = buildFailureMeta({
-                source: "solver",
+                source:
+                  result?.requiresConcepts || result?.stats?.requiresConcepts
+                    ? "concept"
+                    : "solver",
                 challenge,
                 challengeName,
                 cycleIndex,
@@ -19208,10 +19422,10 @@
       );
 
       notifyPhase("solving", `Solving ${challengeName}...`);
-      const solveResult = await callSolveBridge(
+      const solveResult = await solveWithConceptFallback(
         {
+          payload: { _cacheRevision: runContext?._cacheRevision ?? null },
           players: filteredPlayers,
-          _cacheRevision: runContext?._cacheRevision ?? null,
           requirements: safeRequirements,
           requirementsNormalized: safeRequirementsNormalized,
           requiredPlayers: slotInfo?.requiredPlayers ?? null,
@@ -19226,15 +19440,23 @@
             excludedPlayerIds: Array.from(effectiveExcluded),
           },
           debug: debugEnabled,
+          playerById: runContext?.playerById ?? null,
+          label: "sequence-step",
         },
-        safeRequirementsNormalized,
       );
 
-      if (!solveResult?.solutions?.length) {
+      if (
+        !solveResult?.solutions?.length ||
+        solveResult?.requiresConcepts ||
+        solveResult?.stats?.requiresConcepts
+      ) {
         const failing = Array.isArray(solveResult?.failingRequirements)
           ? solveResult.failingRequirements
           : [];
-        const reason = buildSequenceSolverFailureReason(failing);
+        const reason =
+          solveResult?.requiresConcepts || solveResult?.stats?.requiresConcepts
+            ? "Planning-only concept solution found; not queued for sequence submit."
+            : buildSequenceSolverFailureReason(failing);
         markRunProgressPhase(
           sequenceSolveOverlayState?.runState,
           progressAttemptKey,
@@ -19294,7 +19516,10 @@
           code: "NO_SOLUTION",
           message: reason,
           failureContext: buildFailureContext({
-            source: "solver",
+            source:
+              solveResult?.requiresConcepts || solveResult?.stats?.requiresConcepts
+                ? "concept"
+                : "solver",
             reason,
             phase: "solving",
             failingRequirements:
@@ -20928,6 +21153,9 @@
 
   const ensureSolveButton = (view, challenge) => {
     if (!view) return;
+    try {
+      if (challenge) view.__eaDataChallenge = challenge;
+    } catch {}
     const root = view.__content ?? view.getRootElement?.() ?? null;
     if (!root) return;
 
@@ -21017,13 +21245,16 @@
     button.textContent = "Solve Squad";
     button.addEventListener("click", async () => {
       console.log("[EA Data] Solve Squad clicked");
+      const startedChallenge =
+        currentChallenge ?? challenge ?? view?.__eaDataChallenge ?? null;
+      const startedChallengeId = startedChallenge?.id ?? null;
+      let initialSolverSettings = null;
       try {
-        let solverSettings = null;
         try {
-          solverSettings =
+          initialSolverSettings =
             await getSolverSettingsForChallenge(startedChallengeId);
         } catch {
-          solverSettings = getDefaultSolverSettings();
+          initialSolverSettings = getDefaultSolverSettings();
         }
         dismissToast(activeProgressToast);
       } catch {}
@@ -21033,17 +21264,19 @@
         message: "within Constraints",
         timeoutMs: 0,
       });
-      const startedChallengeId = currentChallenge?.id ?? null;
       button.disabled = true;
-      showLoadingOverlay("Fetching players...");
+      showLoadingOverlay(
+        "Fetching players...",
+        buildSolverLoadingSettingsSummary(
+          initialSolverSettings ?? getDefaultSolverSettings(),
+        ),
+      );
       try {
-        let solverSettings = null;
-        try {
-          solverSettings =
-            await getSolverSettingsForChallenge(startedChallengeId);
-        } catch {
-          solverSettings = getDefaultSolverSettings();
-        }
+        let solverSettings =
+          initialSolverSettings ?? getDefaultSolverSettings();
+        let solverLoadingSummary =
+          buildSolverLoadingSettingsSummary(solverSettings);
+        updateLoadingOverlay("Fetching players...", solverLoadingSummary);
         const payload = await window.eaData.getSolverPayload({
           ignoreLoaned: true,
           includeUnassigned: Boolean(solverSettings?.useUnassigned),
@@ -21062,7 +21295,7 @@
           } catch {}
           return;
         }
-        updateLoadingOverlay("Solving squad...");
+        updateLoadingOverlay("Solving with owned players...", solverLoadingSummary);
         const slowSolveTimer = setTimeout(() => {
           updateLoadingOverlay(
             "Still solving... (this can take up to ~1 minute)",
@@ -21155,6 +21388,11 @@
           after: filteredPlayers.length,
           required: requiredIds.size,
         });
+        solverLoadingSummary = buildSolverLoadingSettingsSummary(
+          solverSettings,
+          { poolSize: filteredPlayers.length },
+        );
+        updateLoadingOverlay("Solving with owned players...", solverLoadingSummary);
         const mergedFilters = {
           ...(payload.filters && typeof payload.filters === "object"
             ? payload.filters
@@ -21200,6 +21438,285 @@
             };
           }
           return null;
+        };
+        const defineItemMethod = (item, name, fn) => {
+          if (!item || typeof item !== "object") return;
+          if (typeof item[name] === "function") return;
+          try {
+            item[name] = fn;
+            if (typeof item[name] === "function") return;
+          } catch {}
+          try {
+            Object.defineProperty(item, name, {
+              value: fn,
+              configurable: true,
+              writable: true,
+            });
+          } catch {}
+        };
+        const ensureSquadPlayerApi = (item, options = {}) => {
+          if (!item || typeof item !== "object") return item ?? null;
+          defineItemMethod(item, "isPlayer", () => true);
+          defineItemMethod(item, "isValid", () => true);
+          if (options?.concept === true) {
+            defineItemMethod(item, "isConcept", () => true);
+          }
+          return item;
+        };
+        const createConceptItemFromDefinition = (definitionId) => {
+          const defId = readNumeric(definitionId);
+          if (defId == null) return null;
+          const ItemCtor = window?.UTItemEntity ?? globalThis?.UTItemEntity;
+          if (typeof ItemCtor !== "function") return null;
+          const item = new ItemCtor();
+          const setItemField = (key, value) => {
+            try {
+              item[key] = value;
+            } catch {}
+          };
+          setItemField("id", defId);
+          setItemField("definitionId", defId);
+          setItemField("concept", true);
+          setItemField("stackCount", 1);
+          return ensureSquadPlayerApi(item, { concept: true });
+        };
+        const readSolutionPlayer = (id, playerMap, sourcePayload) => {
+          if (id == null) return null;
+          const direct =
+            playerMap?.get?.(String(id)) ?? playerMap?.get?.(id) ?? null;
+          if (direct) return direct;
+          const payloadPlayers = Array.isArray(sourcePayload?.players)
+            ? sourcePayload.players
+            : [];
+          return (
+            payloadPlayers.find(
+              (player) =>
+                player &&
+                (String(player.id) === String(id) ||
+                  String(player.definitionId) === String(id)),
+            ) ?? null
+          );
+        };
+        const buildSolutionPlayerRefs = (
+          ids = [],
+          playerMap,
+          sourcePayload,
+        ) =>
+          (ids || []).map((id) => {
+            const player = readSolutionPlayer(id, playerMap, sourcePayload);
+            const isConcept = isConceptPlayerRecord(player);
+            const definitionId =
+              readNumeric(player?.definitionId) ??
+              readNumeric(player?.conceptId) ??
+              readNumeric(String(id ?? "").replace(/^concept:/, ""));
+            return {
+              id: isConcept ? 0 : readNumeric(id),
+              definitionId,
+              solverId: id,
+              concept: isConcept,
+            };
+          });
+        const resolvePlayerRefToItem = (ref, lookup) => {
+          if (!ref) return null;
+          const localId = readNumeric(ref?.id);
+          const definitionId = readNumeric(ref?.definitionId);
+          const match =
+            localId && localId !== 0
+              ? lookup?.get?.(localId) ?? lookup?.get?.(String(localId)) ?? null
+              : null;
+          if (match && typeof match === "object") {
+            return ensureSquadPlayerApi(match);
+          }
+          return createConceptItemFromDefinition(definitionId);
+        };
+        const buildPlayersToApplyFromRefs = ({
+          squad,
+          refs,
+          lookup,
+          slotSolution,
+        }) => {
+          const slots = Array.isArray(squad?.getPlayers?.())
+            ? squad.getPlayers()
+            : [];
+          const length = Math.max(slots.length || 0, refs?.length || 0);
+          const list = new Array(length).fill(null);
+          const slotIndices = slotSolution?.fieldSlotIndices;
+          const slotIds = slotSolution?.fieldSlotToPlayerId;
+          const directed =
+            Array.isArray(slotIndices) &&
+            Array.isArray(slotIds) &&
+            slotIndices.length === refs.length;
+          if (directed) {
+            for (let i = 0; i < refs.length; i += 1) {
+              const slotIndex = readNumeric(slotIndices[i]);
+              if (slotIndex == null || slotIndex < 0 || slotIndex >= list.length)
+                continue;
+              list[slotIndex] = resolvePlayerRefToItem(refs[i], lookup);
+            }
+            return list;
+          }
+          return refs.map((ref) => resolvePlayerRefToItem(ref, lookup));
+        };
+        const applyConceptPlanToChallengeUi = async ({
+          challenge,
+          solveResult,
+          sourcePayload,
+          playerMap,
+        }) => {
+          if (!challenge?.squad?.setPlayers) {
+            throw new Error("Open challenge squad is unavailable.");
+          }
+          const solutionIds = solveResult?.solutions?.[0] ?? [];
+          const conceptIds = (solutionIds ?? []).filter((id) => {
+            const player =
+              playerMap?.get?.(String(id)) ??
+              playerMap?.get?.(id) ??
+              null;
+            return isConceptPlayerRecord(player);
+          });
+          const slotSolution = buildResolvedSlotSolution(
+            solveResult,
+            sourcePayload,
+          );
+          const solutionRefs = buildSolutionPlayerRefs(
+            solutionIds,
+            playerMap,
+            sourcePayload,
+          );
+          const localLookup = await getSquadLookupForSbc("id", {
+            ...createApplyLookupOptions(),
+            raw: true,
+            includeUnassigned: true,
+            refreshUnassigned: true,
+            excludeActiveSquad: false,
+          });
+          const backupPlayers = Array.isArray(challenge.squad.getPlayers?.())
+            ? challenge.squad
+                .getPlayers()
+                .map((slot) => resolveSlotItem(slot) ?? slot ?? null)
+            : [];
+          const restoreBackup = () => {
+            if (!backupPlayers.length) return;
+            try {
+              challenge.squad.removeAllItems?.();
+              challenge.squad.setPlayers(backupPlayers, true);
+            } catch {
+              try {
+                challenge.squad.setPlayers(backupPlayers);
+              } catch {}
+            }
+          };
+          const summarizeApplyItems = (items) =>
+            (items || []).map((item, index) => ({
+              index,
+              id: item?.id ?? null,
+              definitionId: item?.definitionId ?? null,
+              concept: Boolean(item?.concept),
+              name:
+                item?.name ??
+                item?.commonName ??
+                item?._staticData?.name ??
+                null,
+              ctor: item?.constructor?.name ?? null,
+              hasIsPlayer: typeof item?.isPlayer === "function",
+              hasIsValid: typeof item?.isValid === "function",
+              hasIsConcept: typeof item?.isConcept === "function",
+            }));
+          const buildPlayersToApply = () =>
+            buildPlayersToApplyFromRefs({
+              squad: challenge.squad,
+              refs: solutionRefs,
+              lookup: localLookup,
+              slotSolution,
+            });
+          const trySetPlayers = (playersToApply, label) => {
+            if (!playersToApply.some(Boolean)) {
+              throw new Error(
+                `Concept plan did not resolve any squad items (${label}).`,
+              );
+            }
+            try {
+              challenge.squad.removeAllItems?.();
+              challenge.squad.setPlayers(playersToApply, true);
+              return;
+            } catch (firstApplyError) {
+              console.log(
+                "[EA Data] Concept UI setPlayers retrying without validation flag",
+                {
+                  challengeId: challenge?.id ?? null,
+                  label,
+                  error: String(firstApplyError?.message ?? firstApplyError),
+                  itemSummary: summarizeApplyItems(playersToApply),
+                },
+              );
+              challenge.squad.removeAllItems?.();
+              challenge.squad.setPlayers(playersToApply);
+            }
+          };
+          const saveReloadAndNormalize = async () => {
+            const saveResult = await saveChallenge(challenge);
+            const saveFailed =
+              saveResult?.success === false ||
+              (saveResult?.status != null &&
+                readNumeric(saveResult.status) != null &&
+                readNumeric(saveResult.status) >= 400) ||
+              Boolean(saveResult?.error);
+            if (saveFailed) {
+              const error = new Error(
+                `Concept plan applied but save failed (status ${saveResult?.status ?? "?"}).`,
+              );
+              error.saveResult = saveResult;
+              throw error;
+            }
+            const reloaded = await loadChallenge(challenge, true, {
+              force: true,
+            });
+            const reloadedSquad =
+              reloaded?.data?.squad ??
+              reloaded?.squad ??
+              reloaded?.data?.challenge?.squad ??
+              null;
+            const reloadedSlots = Array.isArray(reloadedSquad?.getPlayers?.())
+              ? reloadedSquad.getPlayers()
+              : [];
+            const normalizedPlayers = reloadedSlots.map(
+              (slot) => resolveSlotItem(slot) ?? slot ?? null,
+            );
+            if (!normalizedPlayers.some(Boolean)) {
+              const error = new Error(
+                "Concept plan applied but reload returned no squad players.",
+              );
+              error.saveResult = saveResult;
+              error.reloadResult = reloaded;
+              throw error;
+            }
+            challenge.squad.setPlayers(normalizedPlayers, true);
+            return {
+              saveStatus: saveResult?.status ?? null,
+              saveSuccess: saveResult?.success ?? null,
+              normalizedCount: normalizedPlayers.filter(Boolean).length,
+              normalizedSummary: summarizeApplyItems(normalizedPlayers),
+            };
+          };
+          const playersToApply = buildPlayersToApply();
+          try {
+            trySetPlayers(playersToApply, "concept_refs");
+          } catch (applyError) {
+            restoreBackup();
+            applyError.itemSummary = summarizeApplyItems(playersToApply);
+            throw applyError;
+          }
+          const normalization = await saveReloadAndNormalize();
+          try {
+            challenge.onDataChange?.notify?.({ squad: challenge.squad });
+          } catch {}
+          return {
+            appliedCount: playersToApply.filter(Boolean).length,
+            conceptCount: conceptIds.length,
+            mode: "concept_refs",
+            solutionRefs,
+            normalization,
+          };
         };
         const isApplyPoolMissingError = (error) => {
           if (!error) return false;
@@ -21328,10 +21845,11 @@
             result: retryResult,
           };
         };
-        const result = await callSolveBridge(
+        const singleSolvePlayerById = buildPlayerByIdMap(payload);
+        const result = await solveWithConceptFallback(
           {
+            payload,
             players: filteredPlayers,
-            _cacheRevision: payload?._cacheRevision ?? null,
             requirements: safeRequirements,
             requirementsNormalized: safeRequirementsNormalized,
             requiredPlayers: payload.requiredPlayers ?? null,
@@ -21339,8 +21857,15 @@
             prioritize: payload.prioritize,
             filters: mergedFilters,
             debug: debugEnabled,
+            playerById: singleSolvePlayerById,
+            label: "single",
+            onStatus: (status) => {
+              updateLoadingOverlay(
+                status?.label ?? "Trying concept-player fallback...",
+                solverLoadingSummary,
+              );
+            },
           },
-          safeRequirementsNormalized,
         );
         clearTimeout(slowSolveTimer);
         _log("[EA Data] Solver result", result);
@@ -21354,7 +21879,154 @@
         logSolverDebugResult("single", result, {
           challengeId: startedChallengeId,
         });
-        if (result?.solutions?.length && currentChallenge) {
+        const activeChallengeForApply =
+          currentChallenge?.id === startedChallengeId
+            ? currentChallenge
+            : challenge?.id === startedChallengeId
+              ? challenge
+              : currentChallenge ?? challenge ?? startedChallenge;
+        if (result?.solutions?.length) {
+          if (!activeChallengeForApply) {
+            try {
+              dismissToast(activeProgressToast);
+              activeProgressToast = null;
+            } catch {}
+            console.log("[EA Data] Solved squad but no active challenge to apply", {
+              challengeId: startedChallengeId,
+              solutionSize: result?.solutions?.[0]?.length ?? 0,
+              requiresConcepts:
+                Boolean(result?.requiresConcepts) ||
+                Boolean(result?.stats?.requiresConcepts),
+            });
+            showToast({
+              type: "info",
+              title: "Concept Plan Found",
+              message:
+                "The solver found a plan, but the open SBC panel reference was unavailable. Reopen the challenge and try again.",
+              timeoutMs: 12000,
+            });
+            return;
+          }
+          const resultConceptCount =
+            readNumeric(result?.stats?.conceptCount) ??
+            readNumeric(result?.conceptUsage?.conceptCount) ??
+            (Array.isArray(result?.conceptPlayersUsed)
+              ? result.conceptPlayersUsed.length
+              : 0);
+          const resultUsesConcepts =
+            Boolean(result?.requiresConcepts || result?.stats?.requiresConcepts) ||
+            resultConceptCount > 0;
+          if (resultUsesConcepts) {
+            const conceptCount =
+              resultConceptCount ??
+              (Array.isArray(result?.conceptPlayersUsed)
+                ? result.conceptPlayersUsed.length
+                : 0);
+            console.log("[EA Data] Concept planning-only solution", {
+              challengeId: activeChallengeForApply?.id ?? null,
+              conceptCount,
+              conceptPlayersUsed:
+                result?.conceptPlayersUsed ??
+                result?.stats?.conceptPlayersUsed ??
+                [],
+              diagnostics:
+                result?.conceptDiagnostics ??
+                result?.stats?.conceptDiagnostics ??
+                null,
+            });
+            try {
+              window.__eaDataSolver = window.__eaDataSolver || {};
+              window.__eaDataSolver.lastConceptPlan = {
+                at: Date.now(),
+                challengeId: activeChallengeForApply?.id ?? null,
+                conceptCount,
+                rows: buildRowsForSolvedSolution({
+                  solutionIds: result?.solutions?.[0] ?? [],
+                  slotSolution: result?.solutionSlots?.[0] ?? null,
+                  playerById: singleSolvePlayerById,
+                  sortKey: "slot",
+                }),
+                solutionIds: result?.solutions?.[0] ?? [],
+                solutionRefs: buildSolutionPlayerRefs(
+                  result?.solutions?.[0] ?? [],
+                  singleSolvePlayerById,
+                  payload,
+                ),
+                slotSolution: result?.solutionSlots?.[0] ?? null,
+                conceptPlayersUsed:
+                  result?.conceptPlayersUsed ??
+                  result?.stats?.conceptPlayersUsed ??
+                  [],
+                chemistry: result?.stats?.chemistry ?? null,
+                squadRating: result?.stats?.squadRating ?? null,
+                ratingTarget: result?.stats?.ratingTarget ?? null,
+              };
+            } catch {}
+            updateLoadingOverlay("Applying concept plan...");
+            let conceptApply = null;
+            try {
+              conceptApply = await applyConceptPlanToChallengeUi({
+                challenge: activeChallengeForApply,
+                solveResult: result,
+                sourcePayload: payload,
+                playerMap: singleSolvePlayerById,
+              });
+              try {
+                window.__eaDataSolver = window.__eaDataSolver || {};
+                window.__eaDataSolver.lastConceptApplyResult = {
+                  at: Date.now(),
+                  challengeId: activeChallengeForApply?.id ?? null,
+                  ...conceptApply,
+                };
+                window.__eaDataSolver.lastConceptApplyError = null;
+              } catch {}
+            } catch (conceptApplyError) {
+              const conceptApplyFailure = {
+                challengeId: activeChallengeForApply?.id ?? null,
+                error: String(conceptApplyError?.message ?? conceptApplyError),
+                stack: conceptApplyError?.stack ?? null,
+                itemSummary: conceptApplyError?.itemSummary ?? null,
+                conceptApplyError:
+                  conceptApplyError?.conceptApplyError ?? null,
+              };
+              try {
+                window.__eaDataSolver = window.__eaDataSolver || {};
+                window.__eaDataSolver.lastConceptApplyError = {
+                  at: Date.now(),
+                  ...conceptApplyFailure,
+                };
+              } catch {}
+              console.log(
+                "[EA Data] Concept plan auto-apply failed",
+                conceptApplyFailure,
+              );
+              try {
+                dismissToast(activeProgressToast);
+                activeProgressToast = null;
+              } catch {}
+              showToast({
+                type: "error",
+                title: "Concept Apply Failed",
+                message:
+                  "EA rejected the concept preview apply. Check console for details.",
+                timeoutMs: 12000,
+              });
+              return;
+            }
+            updateLoadingOverlay("Refreshing UI...");
+            refreshSbcPanelView(view, activeChallengeForApply, { mode: "safe" });
+            try {
+              dismissToast(activeProgressToast);
+              activeProgressToast = null;
+            } catch {}
+            showToast({
+              type: "info",
+              title: "Concept Plan Applied",
+              message: `Preview applied with ${conceptApply?.conceptCount || conceptCount} concept player(s). It cannot be submitted until those players are owned.`,
+              timeoutMs: 12000,
+            });
+            return;
+          }
           // If the current squad already contains the same players, avoid re-saving the squad.
           // Repeated saves can trigger EA-side errors (ex: 475) and can leave the UI in a stale state.
           const squadSize =
@@ -21409,7 +22081,7 @@
           })();
           if (isSameApplied) {
             updateLoadingOverlay("Refreshing UI...");
-            refreshSbcPanelView(view, currentChallenge, { mode: "safe" });
+            refreshSbcPanelView(view, activeChallengeForApply, { mode: "safe" });
             try {
               dismissToast(activeProgressToast);
               activeProgressToast = null;
@@ -21432,12 +22104,12 @@
               payload,
             );
             await applySolutionWithSelectedMode(
-              currentChallenge,
+              activeChallengeForApply,
               result.solutions[0],
               {
                 lookupKey: "id",
                 slotSolution: resolvedSlotSolution,
-                playerById: buildPlayerByIdMap(payload),
+                playerById: singleSolvePlayerById,
               },
             );
           } catch (applyError) {
@@ -21465,7 +22137,7 @@
             recovered = true;
           }
           console.log("[EA Data] Solver applied", {
-            challengeId: currentChallenge?.id ?? null,
+            challengeId: activeChallengeForApply?.id ?? null,
             solutionSize: appliedSolveResult?.solutions?.[0]?.length ?? 0,
             recovered,
           });
@@ -21475,7 +22147,7 @@
             APPLY_MODE_EXPERIMENTAL_HYBRID
               ? "safe"
               : "deep";
-          refreshSbcPanelView(view, currentChallenge, {
+          refreshSbcPanelView(view, activeChallengeForApply, {
             mode: refreshModeAfterApply,
           });
           try {
@@ -21710,6 +22382,27 @@
     _log(...args);
   };
 
+  const loggedSolverBridgeTraceKeys = new Set();
+  const logSolverBridgeTrace = (detail) => {
+    if (!debugEnabled || !detail) return;
+    const key = [
+      detail?.stage ?? "",
+      detail?.requestId ?? "",
+      JSON.stringify(detail?.details ?? null),
+    ].join("|");
+    if (loggedSolverBridgeTraceKeys.has(key)) return;
+    loggedSolverBridgeTraceKeys.add(key);
+    if (loggedSolverBridgeTraceKeys.size > 200) {
+      const firstKey = loggedSolverBridgeTraceKeys.values().next().value;
+      if (firstKey) loggedSolverBridgeTraceKeys.delete(firstKey);
+    }
+    _log("[EA Data] Solver bridge trace", {
+      stage: detail.stage,
+      requestId: detail.requestId,
+      details: detail.details ?? null,
+    });
+  };
+
   const logSolverDebugResult = (label, result, extra = null) => {
     if (!debugEnabled) return;
     const stats = result?.stats ?? null;
@@ -21723,6 +22416,22 @@
     });
     if (stats?.orchestration) {
       _log("[EA Data] Solver orchestration", stats.orchestration);
+    }
+    if (stats?.scopeAnalysis) {
+      _log("[EA Data] Solver scope analysis", {
+        label: label ?? "solve",
+        ...(extra && typeof extra === "object" ? extra : {}),
+        challengeShape: stats.scopeAnalysis.challengeShape ?? null,
+        failureShape: stats.scopeAnalysis.failureShape ?? null,
+        conceptSearchEligible:
+          stats.scopeAnalysis.conceptSearchEligible ?? false,
+        scopeLocks: stats.scopeAnalysis.scopeLocks ?? [],
+        scopeRequirements: stats.scopeAnalysis.scopeRequirements ?? [],
+        shortcomings: stats.scopeAnalysis.shortcomings ?? [],
+        searchHints: stats.scopeAnalysis.searchHints ?? [],
+        inputs: stats.scopeAnalysis.inputs ?? null,
+        reasoning: stats.scopeAnalysis.reasoning ?? [],
+      });
     }
     if (stats?.debugLog?.length) {
       _log("[EA Data] Solver debug log", stats.debugLog);
@@ -22073,6 +22782,7 @@
     SOLVER_EXCLUDE_SPECIAL: "solver.excludeSpecial",
     SOLVER_USE_TOTW_PLAYERS: "solver.useTotwPlayers",
     SOLVER_USE_EVOLUTION_PLAYERS: "solver.useEvolutionPlayers",
+    SOLVER_ALLOW_CONCEPT_PLAYERS: "solver.allowConceptPlayers",
     SOLVER_EXCLUDED_PLAYER_IDS: "solver.excludedPlayerIds",
     SOLVER_EXCLUDED_LEAGUE_IDS: "solver.excludedLeagueIds",
     SOLVER_EXCLUDED_NATION_IDS: "solver.excludedNationIds",
@@ -22094,6 +22804,7 @@
       excludeSpecial: true,
       useTotwPlayers: true,
       useEvolutionPlayers: false,
+      allowConceptPlayers: false,
       excludedPlayerIds: Object.freeze([]),
       excludedLeagueIds: Object.freeze([]),
       excludedNationIds: Object.freeze([]),
@@ -22155,6 +22866,15 @@
       idSuffix: "use-evolution-players",
       label: "Use Evolution Players",
       help: "Allow evolution cards in generated solutions. When off, evolution cards are blocked (including unassigned duplicates) except already locked required players.",
+      scopes: Object.freeze(["challenge", "global", "multi", "set"]),
+      legacyKeys: Object.freeze([]),
+    }),
+    Object.freeze({
+      key: "allowConceptPlayers",
+      path: SETTINGS_PATHS.SOLVER_ALLOW_CONCEPT_PLAYERS,
+      idSuffix: "allow-concept-players",
+      label: "Fallback on Concept Players (experimental)",
+      help: "Allow concept fallback after owned players fail. Concept squads can be preview-applied, but cannot be submitted until those players are owned.",
       scopes: Object.freeze(["challenge", "global", "multi", "set"]),
       legacyKeys: Object.freeze([]),
     }),
@@ -24172,6 +24892,1089 @@
         excludedNationIds,
       },
     };
+  };
+
+  const isConceptPlayerRecord = (player) =>
+    Boolean(
+      player?.isConcept === true ||
+        player?.concept === true ||
+        player?.__eaDataConcept === true ||
+        player?.source === "concept" ||
+        (typeof player?.id === "string" && player.id.startsWith("concept:")),
+    );
+
+  const getConceptPlayerName = (raw) =>
+    raw?._staticData?.name ??
+    raw?._staticData?.knownAs ??
+    raw?.name ??
+    raw?.commonName ??
+    null;
+
+  const inferConceptIsSpecial = (raw, rarityId) => {
+    const rarity = readNumeric(rarityId);
+    if (rarity != null) return rarity > 1;
+    if (raw?.isSpecial != null) return Boolean(raw.isSpecial);
+    const groups = Array.isArray(raw?.groups) ? raw.groups.map(Number) : [];
+    if (groups.includes(43) || groups.includes(44)) return true;
+    return false;
+  };
+
+  const POSITION_ID_NAME_FALLBACK = new Map([
+    [0, "GK"],
+    [3, "LB"],
+    [5, "CB"],
+    [7, "RB"],
+    [10, "CDM"],
+    [12, "RM"],
+    [14, "CM"],
+    [16, "LM"],
+    [18, "CAM"],
+    [21, "CF"],
+    [23, "RW"],
+    [25, "ST"],
+    [27, "LW"],
+  ]);
+
+  const resolvePositionNameForSolver = (positionId) => {
+    if (positionId == null) return null;
+    return (
+      getPositionName(positionId) ??
+      POSITION_ID_NAME_FALLBACK.get(Number(positionId)) ??
+      String(positionId)
+    );
+  };
+
+  const unwrapConceptSearchItem = (raw) =>
+    raw?.item ??
+    raw?.itemData ??
+    raw?.player ??
+    raw?.asset ??
+    raw?.data ??
+    raw;
+
+  const readConceptPositionId = (raw) =>
+    raw?.preferredPosition ??
+    raw?.preferredPositionId ??
+    raw?.position ??
+    raw?.positionId ??
+    raw?._preferredPosition ??
+    null;
+
+  const readConceptPositionIds = (raw, preferredPositionId = null) => {
+    const candidates = [
+      raw?.basePossiblePositions,
+      raw?.possiblePositions,
+      raw?.alternativePositionIds,
+      raw?.alternativePositions,
+      raw?.altPositions,
+      raw?.positions,
+    ];
+    for (const value of candidates) {
+      if (!Array.isArray(value)) continue;
+      const ids = value
+        .map((entry) =>
+          typeof entry === "object"
+            ? (entry?.id ?? entry?.positionId ?? entry?.value ?? null)
+            : entry,
+        )
+        .filter((entry) => entry != null);
+      if (ids.length) return ids;
+    }
+    return preferredPositionId != null ? [preferredPositionId] : [];
+  };
+
+  const normalizeConceptPlayerForSolver = (raw) => {
+    raw = unwrapConceptSearchItem(raw);
+    if (!raw || typeof raw !== "object") return null;
+    const conceptId = readNumeric(raw?.id) ?? readNumeric(raw?.definitionId);
+    const definitionId = readNumeric(raw?.definitionId) ?? conceptId;
+    const rating = readNumeric(raw?.rating) ?? readNumeric(raw?._rating);
+    if (conceptId == null || definitionId == null || rating == null) {
+      return null;
+    }
+    const rarityId =
+      raw?.rarityId ?? raw?.rareflag ?? raw?._rareflag ?? raw?.rarity ?? null;
+    const preferredPositionId = readConceptPositionId(raw);
+    const positionIds = readConceptPositionIds(raw, preferredPositionId);
+    const preferredPositionName =
+      raw?.preferredPositionName ??
+      raw?.positionName ??
+      resolvePositionNameForSolver(preferredPositionId) ??
+      (preferredPositionId != null ? String(preferredPositionId) : null);
+    const alternativePositionNames = Array.isArray(raw?.alternativePositionNames)
+      ? raw.alternativePositionNames.slice()
+      : positionIds
+          .map((positionId) => resolvePositionNameForSolver(positionId))
+          .filter(Boolean);
+    const isSpecial = inferConceptIsSpecial(raw, rarityId);
+    const isTotwOrTots =
+      readNumeric(rarityId) === 3 ||
+      String(raw?.rarityName ?? "")
+        .toLowerCase()
+        .includes("tots") ||
+      String(raw?.rarityName ?? "")
+        .toLowerCase()
+        .includes("totw");
+    const quality = getPlayerQualityBucket({ rating });
+    const name = getConceptPlayerName(raw);
+    const normalized = {
+      id: `concept:${conceptId}`,
+      conceptId,
+      definitionId,
+      assetId: raw?.assetId ?? raw?._assetId ?? null,
+      rating,
+      name,
+      commonName: name,
+      teamId: raw?.teamId ?? null,
+      leagueId: raw?.leagueId ?? null,
+      nationId: raw?.nationId ?? null,
+      rarityId,
+      rarityName: raw?.rarityName ?? null,
+      preferredPositionId,
+      preferredPositionName,
+      alternativePositionIds: positionIds,
+      alternativePositionNames,
+      basePossiblePositions: positionIds,
+      preferredPosition: preferredPositionId,
+      gender: raw?.gender ?? null,
+      groups: Array.isArray(raw?.groups) ? raw.groups.slice() : [],
+      subtype: raw?.subtype ?? null,
+      attributes: Array.isArray(raw?.attributes) ? raw.attributes.slice() : [],
+      quality,
+      isSpecial,
+      isTotw: isTotwOrTots && readNumeric(rarityId) === 3,
+      isTots:
+        String(raw?.rarityName ?? "")
+          .toLowerCase()
+          .includes("tots") || false,
+      isTotwOrTots,
+      isConcept: true,
+      concept: true,
+      isOwned: false,
+      isTradeable: false,
+      isUntradeable: true,
+      isStorage: false,
+      isUnassigned: false,
+      source: "concept",
+    };
+    return normalized;
+  };
+
+  const normalizeConceptSearchResponse = (response) => {
+    const items =
+      response?.response?.items ??
+      response?.data?.response?.items ??
+      response?.items ??
+      response?.data?.items ??
+      response?.itemData ??
+      response?.data?.itemData ??
+      response?.response?.itemData ??
+      response?.data?.response?.itemData ??
+      [];
+    return Array.isArray(items)
+      ? items.map(normalizeConceptPlayerForSolver).filter(Boolean)
+      : [];
+  };
+
+  const summarizeConceptSearchResponse = (response) => ({
+    success: response?.success ?? response?.data?.success ?? null,
+    status: response?.status ?? response?.data?.status ?? null,
+    hasData: response?.data != null,
+    hasResponse: response?.response != null || response?.data?.response != null,
+    endOfList:
+      response?.response?.endOfList ??
+      response?.data?.response?.endOfList ??
+      null,
+    itemCount:
+      (Array.isArray(response?.response?.items)
+        ? response.response.items.length
+        : null) ??
+      (Array.isArray(response?.data?.response?.items)
+        ? response.data.response.items.length
+        : null) ??
+      (Array.isArray(response?.items) ? response.items.length : null) ??
+      (Array.isArray(response?.data?.items) ? response.data.items.length : null) ??
+      (Array.isArray(response?.itemData) ? response.itemData.length : null) ??
+      (Array.isArray(response?.data?.itemData)
+        ? response.data.itemData.length
+        : null),
+    keys:
+      response && typeof response === "object"
+        ? Object.keys(response).slice(0, 12)
+        : [],
+    dataKeys:
+      response?.data && typeof response.data === "object"
+        ? Object.keys(response.data).slice(0, 12)
+        : [],
+    responseKeys:
+      (response?.response && typeof response.response === "object"
+        ? Object.keys(response.response).slice(0, 12)
+        : null) ??
+      (response?.data?.response && typeof response.data.response === "object"
+        ? Object.keys(response.data.response).slice(0, 12)
+        : []),
+  });
+
+  const resolveConceptSearchServiceResult = async (rawResult) => {
+    if (rawResult && typeof rawResult.observe === "function") {
+      return observableToPromise(rawResult);
+    }
+    if (rawResult && typeof rawResult.then === "function") {
+      return await rawResult;
+    }
+    return rawResult;
+  };
+
+  const getConceptSearchLevel = (level) => {
+    const text = String(level ?? "gold").trim().toLowerCase();
+    const SearchLevelRef = window?.SearchLevel ?? globalThis?.SearchLevel ?? {};
+    if (text === "bronze") return SearchLevelRef.BRONZE ?? "bronze";
+    if (text === "silver") return SearchLevelRef.SILVER ?? "silver";
+    if (text === "special" || text === "sp") {
+      return SearchLevelRef.SPECIAL ?? "special";
+    }
+    if (text === "any") return SearchLevelRef.ANY ?? "any";
+    return SearchLevelRef.GOLD ?? "gold";
+  };
+
+  const getRatingBandLevel = (band) => {
+    const min = readNumeric(band?.min);
+    const max = readNumeric(band?.max);
+    if (max != null && max <= 64) return "bronze";
+    if (min != null && min >= 65 && max != null && max <= 74) return "silver";
+    if (min != null && min >= 75) return "gold";
+    return "gold";
+  };
+
+  const getAllowedConceptBaseSearches = (settings, filters = {}) => {
+    const allowedBuckets = normalizeAllowedCardBuckets(
+      settings?.allowedCardBuckets ?? filters?.allowedCardBuckets,
+      getSettingDefault(SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS),
+    );
+    const allowed = new Set(allowedBuckets);
+    const searches = [];
+    for (const level of ["gold", "silver", "bronze"]) {
+      if (allowed.has(`common_${level}`)) {
+        searches.push({
+          level,
+          rarityIds: [0],
+          cardBucket: `common_${level}`,
+        });
+      }
+      if (allowed.has(`rare_${level}`)) {
+        searches.push({
+          level,
+          rarityIds: [1],
+          cardBucket: `rare_${level}`,
+        });
+      }
+    }
+    return searches.length
+      ? searches
+      : [
+          { level: "gold", rarityIds: [0], cardBucket: "common_gold" },
+          { level: "gold", rarityIds: [1], cardBucket: "rare_gold" },
+          { level: "silver", rarityIds: [0], cardBucket: "common_silver" },
+          { level: "silver", rarityIds: [1], cardBucket: "rare_silver" },
+          { level: "bronze", rarityIds: [0], cardBucket: "common_bronze" },
+          { level: "bronze", rarityIds: [1], cardBucket: "rare_bronze" },
+        ];
+  };
+
+  const hasUnsatisfiedConceptSpecialNeed = (scopeAnalysis) => {
+    const specialTypes = new Set([
+      "player_inform",
+      "player_totw_or_tots",
+      "player_tots",
+      "player_rarity_or_totw",
+    ]);
+    const failingTypes = new Set(
+      (scopeAnalysis?.inputs?.failingTypes ?? []).map((type) =>
+        String(type ?? "").toLowerCase(),
+      ),
+    );
+    if (Array.from(failingTypes).some((type) => specialTypes.has(type))) {
+      return true;
+    }
+    return (scopeAnalysis?.inputs?.failingRequirements ?? []).some((entry) =>
+      specialTypes.has(String(entry?.type ?? "").toLowerCase()),
+    );
+  };
+
+  const buildConceptSearchCriteria = (profile) => {
+    const CriteriaCtor =
+      window?.UTSearchCriteriaDTO ?? globalThis?.UTSearchCriteriaDTO;
+    if (typeof CriteriaCtor !== "function") {
+      throw new Error("UTSearchCriteriaDTO is unavailable.");
+    }
+    const SearchTypeRef = window?.SearchType ?? globalThis?.SearchType ?? {};
+    const SearchCategoryRef =
+      window?.SearchCategory ?? globalThis?.SearchCategory ?? {};
+    const criteria = new CriteriaCtor();
+    criteria.type = SearchTypeRef.PLAYER ?? "player";
+    criteria.category = SearchCategoryRef.ANY ?? "any";
+    criteria.count = Math.max(1, Math.min(21, readNumeric(profile?.count) ?? 21));
+    criteria.offset = Math.max(0, readNumeric(profile?.offset) ?? 0);
+    criteria.level = getConceptSearchLevel(profile?.level);
+    criteria.sortBy = "ovr";
+    criteria.sort = "desc";
+    if (profile?.position != null && profile.position !== "any") {
+      criteria.position = profile.position;
+    }
+    if (profile?.leagueId != null) criteria.league = profile.leagueId;
+    if (profile?.nationId != null) criteria.nation = profile.nationId;
+    if (profile?.teamId != null) criteria.club = profile.teamId;
+    if (Array.isArray(profile?.rarityIds) && profile.rarityIds.length) {
+      criteria.rarities = profile.rarityIds.slice();
+    }
+    if (profile?.queryMinRating != null) criteria.ovrMin = profile.queryMinRating;
+    if (profile?.queryMaxRating != null) criteria.ovrMax = profile.queryMaxRating;
+    return criteria;
+  };
+
+  const buildConceptSearchProfiles = (scopeAnalysis, filters = {}) => {
+    if (!scopeAnalysis?.conceptSearchEligible) return [];
+    const settings = scopeAnalysis?.inputs?.solverSettings ?? filters ?? {};
+    if (!settings?.allowConceptPlayers && !filters?.allowConceptPlayers) {
+      return [];
+    }
+    if (settings?.onlyStorage || filters?.onlyStorage) {
+      return [];
+    }
+    const profiles = [];
+    const seen = new Set();
+    const pushProfile = (profile) => {
+      if (!profile || profile?.blockedBySettings?.length) return;
+      const key = [
+        profile.reason,
+        profile.position ?? "any",
+        profile.level ?? "gold",
+        profile.leagueId ?? "*",
+        profile.nationId ?? "*",
+        profile.teamId ?? "*",
+        profile.cardBucket ?? "*",
+        (profile.rarityIds ?? []).join(","),
+        profile.requireBaseCard ? "base" : "",
+        profile.allowTotwOrTots ? "totw" : "",
+        profile.minRating ?? "*",
+        profile.maxRating ?? "*",
+      ].join("|");
+      if (seen.has(key)) return;
+      seen.add(key);
+      const isChemistryProfile = String(profile?.reason ?? "").includes(
+        "chemistry",
+      );
+      profiles.push({
+        count: 21,
+        maxPages: isChemistryProfile ? 12 : 3,
+        limit: isChemistryProfile ? 10 : 8,
+        priority: profiles.length,
+        queryMinRating: settings?.ratingMin ?? filters?.ratingMin ?? null,
+        queryMaxRating: settings?.ratingMax ?? filters?.ratingMax ?? null,
+        ...profile,
+      });
+    };
+    const baseSearches = getAllowedConceptBaseSearches(settings, filters);
+    const shouldSearchSpecials =
+      (settings?.useTotwPlayers ?? filters?.useTotwPlayers ?? true) !== false &&
+      hasUnsatisfiedConceptSpecialNeed(scopeAnalysis);
+    const pushSearchProfile = (profile) => {
+      const isChemistryProfile = String(profile?.reason ?? "").includes(
+        "chemistry",
+      );
+      if (!isChemistryProfile) {
+        pushProfile({ ...profile, requireBaseCard: true });
+        if (shouldSearchSpecials) {
+          pushProfile({
+            ...profile,
+            reason: `${profile.reason ?? "scope_hint"}_special_requirement`,
+            level: "special",
+            requireBaseCard: false,
+            allowTotwOrTots: true,
+          });
+        }
+        return;
+      }
+      for (const search of baseSearches) {
+        pushProfile({
+          ...profile,
+          level: search.level,
+          rarityIds: search.rarityIds,
+          cardBucket: search.cardBucket,
+          requireBaseCard: true,
+        });
+      }
+      if (shouldSearchSpecials) {
+        pushProfile({
+          ...profile,
+          reason: `${profile.reason ?? "scope_hint"}_special_requirement`,
+          level: "special",
+          requireBaseCard: false,
+          allowTotwOrTots: true,
+        });
+      }
+    };
+
+    const unsatisfiedRequirements = (scopeAnalysis?.scopeRequirements ?? [])
+      .filter((entry) => entry?.status === "unsatisfied")
+      .flatMap((entry) =>
+        (entry?.ids ?? []).map((id) => ({
+          axis: entry.axis,
+          id,
+          reason: entry.rule ?? `required_${entry.axis}`,
+        })),
+      );
+
+    for (const [index, hint] of (scopeAnalysis?.searchHints ?? []).entries()) {
+      const band = hint?.ratingBand ?? null;
+      const base = {
+        sourceHintIndex: index,
+        reason: hint?.reason ?? "scope_hint",
+        slotIndex: hint?.slotIndex ?? null,
+        position: hint?.position ?? null,
+        level:
+          hint?.quality ??
+          (hint?.rarity === "rare" ? "gold" : getRatingBandLevel(band)),
+        minRating: readNumeric(band?.min),
+        maxRating: readNumeric(band?.max),
+        preserveAxes: Array.isArray(hint?.preserveAxes)
+          ? hint.preserveAxes.slice()
+          : [],
+        constrainedAxes: Array.isArray(hint?.constrainedAxes)
+          ? hint.constrainedAxes.slice()
+          : [],
+        requiredAxes: Array.isArray(hint?.requiredAxes)
+          ? hint.requiredAxes.slice()
+          : [],
+        blockedBySettings: Array.isArray(hint?.blockedBySettings)
+          ? hint.blockedBySettings.slice()
+          : [],
+      };
+      for (const required of unsatisfiedRequirements) {
+        pushSearchProfile({
+          ...base,
+          reason: `${base.reason}_${required.reason}`,
+          leagueId: required.axis === "league" ? required.id : null,
+          nationId: required.axis === "nation" ? required.id : null,
+          teamId: required.axis === "club" ? required.id : null,
+        });
+      }
+      for (const pref of hint?.axisPreference ?? []) {
+        if (!pref || pref?.status === "capped") continue;
+        pushSearchProfile({
+          ...base,
+          leagueId: pref.axis === "league" ? pref.id : null,
+          nationId: pref.axis === "nation" ? pref.id : null,
+          teamId: pref.axis === "club" ? pref.id : null,
+        });
+      }
+      pushSearchProfile(base);
+    }
+    const profileFamilyKey = (profile) => {
+      const axis =
+        profile?.teamId != null
+          ? `club:${profile.teamId}`
+          : profile?.nationId != null
+            ? `nation:${profile.nationId}`
+            : profile?.leagueId != null
+              ? `league:${profile.leagueId}`
+              : "open";
+      return [
+        profile?.sourceHintIndex ?? 999,
+        profile?.position ?? "any",
+        profile?.reason ?? "scope_hint",
+        axis,
+        profile?.allowTotwOrTots ? "special" : "base",
+      ].join("|");
+    };
+    const byFamily = new Map();
+    for (const [index, profile] of profiles.entries()) {
+      const key = profileFamilyKey(profile);
+      if (!byFamily.has(key)) {
+        byFamily.set(key, {
+          firstIndex: index,
+          sourceHintIndex: profile?.sourceHintIndex ?? 999,
+          profiles: [],
+        });
+      }
+      byFamily.get(key).profiles.push(profile);
+    }
+    const groups = Array.from(byFamily.values())
+      .sort(
+        (a, b) =>
+          a.sourceHintIndex - b.sourceHintIndex || a.firstIndex - b.firstIndex,
+      )
+      .map((entry) => entry.profiles.slice());
+    const selected = [];
+    while (selected.length < 24 && groups.some((group) => group.length)) {
+      for (const group of groups) {
+        const next = group.shift();
+        if (!next) continue;
+        selected.push(next);
+        if (selected.length >= 24) break;
+      }
+    }
+    return selected.map((profile, index) => ({ ...profile, priority: index }));
+  };
+
+  const incrementRejectReason = (diagnostics, reason) => {
+    const key = reason || "unknown";
+    diagnostics.rejectedByReason[key] =
+      (readNumeric(diagnostics.rejectedByReason[key]) ?? 0) + 1;
+  };
+
+  const addConceptRejectedSample = (diagnostics, reason, player) => {
+    if (!diagnostics || !player) return;
+    if (!Array.isArray(diagnostics.rejectedSample)) {
+      diagnostics.rejectedSample = [];
+    }
+    if (diagnostics.rejectedSample.length >= 8) return;
+    diagnostics.rejectedSample.push({
+      reason: reason || "unknown",
+      name: player?.name ?? null,
+      rating: player?.rating ?? null,
+      preferredPositionId: player?.preferredPositionId ?? null,
+      preferredPositionName: player?.preferredPositionName ?? null,
+      alternativePositionIds: player?.alternativePositionIds ?? [],
+      alternativePositionNames: player?.alternativePositionNames ?? [],
+      leagueId: player?.leagueId ?? null,
+      nationId: player?.nationId ?? null,
+      teamId: player?.teamId ?? null,
+      rarityId: player?.rarityId ?? null,
+      rarityName: player?.rarityName ?? null,
+      groups: player?.groups ?? [],
+      subtype: player?.subtype ?? null,
+      isSpecial: Boolean(player?.isSpecial),
+      isTotwOrTots: Boolean(player?.isTotwOrTots),
+      id: player?.id ?? null,
+      definitionId: player?.definitionId ?? null,
+    });
+  };
+
+  const rejectConceptCandidate = (diagnostics, reason, player) => {
+    incrementRejectReason(diagnostics, reason);
+    addConceptRejectedSample(diagnostics, reason, player);
+    return false;
+  };
+
+  const passesConceptProfileFilters = ({
+    player,
+    profile,
+    filters,
+    scopeAnalysis,
+    ownedDefinitionIds,
+    keptDefinitionIds,
+    diagnostics,
+  }) => {
+    const rating = readNumeric(player?.rating);
+    const minRating = readNumeric(profile?.minRating);
+    const maxRating = readNumeric(profile?.maxRating);
+    const isChemistryProfile = String(profile?.reason ?? "").includes(
+      "chemistry",
+    );
+    if (
+      !isChemistryProfile &&
+      minRating != null &&
+      rating != null &&
+      rating < minRating
+    ) {
+      return rejectConceptCandidate(diagnostics, "rating_below_min", player);
+    }
+    if (
+      !isChemistryProfile &&
+      maxRating != null &&
+      rating != null &&
+      rating > maxRating
+    ) {
+      return rejectConceptCandidate(diagnostics, "rating_above_max", player);
+    }
+    const settingsRange = normalizeRatingRange({
+      ratingMin: filters?.ratingMin,
+      ratingMax: filters?.ratingMax,
+    });
+    if (
+      rating == null ||
+      rating < settingsRange.ratingMin ||
+      rating > settingsRange.ratingMax
+    ) {
+      return rejectConceptCandidate(diagnostics, "settings_rating_range", player);
+    }
+    if (filters?.onlyStorage) {
+      return rejectConceptCandidate(diagnostics, "only_storage_enabled", player);
+    }
+    const excludedIds = new Set(
+      (filters?.excludedPlayerIds ?? []).map((id) => String(id)),
+    );
+    const candidateIds = [
+      player?.id,
+      player?.conceptId,
+      player?.definitionId,
+      player?.assetId,
+    ]
+      .filter((id) => id != null)
+      .map(String);
+    if (candidateIds.some((id) => excludedIds.has(id))) {
+      return rejectConceptCandidate(diagnostics, "excluded_player", player);
+    }
+    if (
+      player?.leagueId != null &&
+      (filters?.excludedLeagueIds ?? []).map(String).includes(String(player.leagueId))
+    ) {
+      return rejectConceptCandidate(diagnostics, "excluded_league", player);
+    }
+    if (
+      player?.nationId != null &&
+      (filters?.excludedNationIds ?? []).map(String).includes(String(player.nationId))
+    ) {
+      return rejectConceptCandidate(diagnostics, "excluded_nation", player);
+    }
+    const defKey =
+      player?.definitionId == null ? null : String(player.definitionId);
+    if (defKey && (ownedDefinitionIds.has(defKey) || keptDefinitionIds.has(defKey))) {
+      return rejectConceptCandidate(diagnostics, "duplicate_definition", player);
+    }
+    if (!filters?.useTotwPlayers && player?.isTotwOrTots) {
+      return rejectConceptCandidate(diagnostics, "totw_tots_disabled", player);
+    }
+    if (!profile?.allowTotwOrTots && player?.isTotwOrTots) {
+      return rejectConceptCandidate(diagnostics, "totw_tots_not_requested", player);
+    }
+    if (profile?.allowTotwOrTots && player?.isSpecial && !player?.isTotwOrTots) {
+      return rejectConceptCandidate(diagnostics, "special_not_totw_tots", player);
+    }
+    if (profile?.requireBaseCard && player?.isSpecial) {
+      return rejectConceptCandidate(
+        diagnostics,
+        "base_search_returned_special",
+        player,
+      );
+    }
+    if (filters?.excludeSpecial && player?.isSpecial && !profile?.allowTotwOrTots) {
+      return rejectConceptCandidate(diagnostics, "special_disabled", player);
+    }
+    const allowedBuckets = normalizeAllowedCardBuckets(
+      filters?.allowedCardBuckets,
+      getSettingDefault(SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS),
+    );
+    const bucket = getBaseCardBucket(player);
+    if (bucket && !new Set(allowedBuckets).has(bucket)) {
+      return rejectConceptCandidate(diagnostics, "card_bucket_disabled", player);
+    }
+    if (!isChemistryProfile) {
+      for (const lock of scopeAnalysis?.scopeLocks ?? []) {
+        const allowed = new Set((lock?.allowedIds ?? []).map(String));
+        if (!allowed.size) continue;
+        const value =
+          lock.axis === "league"
+            ? player?.leagueId
+            : lock.axis === "nation"
+              ? player?.nationId
+              : lock.axis === "club"
+                ? player?.teamId
+                : null;
+        if (value != null && !allowed.has(String(value))) {
+          return rejectConceptCandidate(
+            diagnostics,
+            "locked_axis_violation",
+            player,
+          );
+        }
+      }
+      for (const axis of profile?.preserveAxes ?? []) {
+        const expected = axis?.id;
+        if (expected == null) continue;
+        const value =
+          axis.axis === "league"
+            ? player?.leagueId
+            : axis.axis === "nation"
+              ? player?.nationId
+              : axis.axis === "club"
+                ? player?.teamId
+                : null;
+        if (value != null && String(value) !== String(expected)) {
+          return rejectConceptCandidate(
+            diagnostics,
+            "preserve_axis_violation",
+            player,
+          );
+        }
+      }
+    }
+    return true;
+  };
+
+  const fetchConceptCandidatesForProfile = async ({
+    profile,
+    filters,
+    scopeAnalysis,
+    ownedDefinitionIds,
+    keptDefinitionIds,
+  }) => {
+    const diagnostics = {
+      profile,
+      fetched: 0,
+      kept: 0,
+      keptSample: [],
+      rejectedSample: [],
+      pages: 0,
+      rejectedByReason: {},
+    };
+    const service = services?.Item?.searchConceptItems;
+    if (typeof service !== "function") {
+      incrementRejectReason(diagnostics, "service_unavailable");
+      return { candidates: [], diagnostics };
+    }
+    const candidates = [];
+    const count = Math.max(1, Math.min(21, readNumeric(profile?.count) ?? 21));
+    const maxPages = Math.max(1, Math.min(12, readNumeric(profile?.maxPages) ?? 2));
+    const limit = Math.max(1, readNumeric(profile?.limit) ?? 12);
+    for (let page = 0; page < maxPages; page += 1) {
+      const criteria = buildConceptSearchCriteria({
+        ...profile,
+        count,
+        offset: page * count,
+      });
+      let response = null;
+      try {
+        response = await resolveConceptSearchServiceResult(
+          service.call(services.Item, criteria),
+        );
+      } catch (error) {
+        incrementRejectReason(diagnostics, "service_error");
+        diagnostics.error = String(error?.message ?? error);
+        break;
+      }
+      diagnostics.lastResponse = summarizeConceptSearchResponse(response);
+      const normalized = normalizeConceptSearchResponse(response);
+      diagnostics.pages += 1;
+      diagnostics.fetched += normalized.length;
+      for (const player of normalized) {
+        if (
+          !passesConceptProfileFilters({
+            player,
+            profile,
+            filters,
+            scopeAnalysis,
+            ownedDefinitionIds,
+            keptDefinitionIds,
+            diagnostics,
+          })
+        ) {
+          continue;
+        }
+        candidates.push(player);
+        if (diagnostics.keptSample.length < 8) {
+          diagnostics.keptSample.push({
+            name: player?.name ?? null,
+            rating: player?.rating ?? null,
+            preferredPositionId: player?.preferredPositionId ?? null,
+            preferredPositionName: player?.preferredPositionName ?? null,
+            alternativePositionIds: player?.alternativePositionIds ?? [],
+            alternativePositionNames: player?.alternativePositionNames ?? [],
+            leagueId: player?.leagueId ?? null,
+            nationId: player?.nationId ?? null,
+            teamId: player?.teamId ?? null,
+            rarityId: player?.rarityId ?? null,
+            isSpecial: Boolean(player?.isSpecial),
+            id: player?.id ?? null,
+            definitionId: player?.definitionId ?? null,
+          });
+        }
+        if (player?.definitionId != null) {
+          keptDefinitionIds.add(String(player.definitionId));
+        }
+        diagnostics.kept += 1;
+        if (candidates.length >= limit) break;
+      }
+      if (candidates.length >= limit) break;
+      const endOfList =
+        response?.response?.endOfList ??
+        response?.data?.response?.endOfList ??
+        response?.endOfList ??
+        response?.data?.endOfList ??
+        null;
+      if (normalized.length === 0 || endOfList === true) break;
+    }
+    return { candidates, diagnostics };
+  };
+
+  const fetchConceptCandidatesForSolve = async ({
+    ownedResult,
+    ownedPlayers,
+    filters,
+  }) => {
+    const scopeAnalysis = ownedResult?.stats?.scopeAnalysis ?? null;
+    const diagnostics = {
+      profilesBuilt: 0,
+      profilesFetched: 0,
+      candidatesFetched: 0,
+      candidatesKept: 0,
+      retry: null,
+      rejectedByReason: {},
+      profileDiagnostics: [],
+      skippedReason: null,
+    };
+    if (!filters?.allowConceptPlayers) {
+      diagnostics.skippedReason = "disabled";
+      return { candidates: [], diagnostics };
+    }
+    if (!scopeAnalysis?.conceptSearchEligible) {
+      diagnostics.skippedReason = "not_eligible";
+      return { candidates: [], diagnostics };
+    }
+    if (filters?.onlyStorage) {
+      diagnostics.skippedReason = "only_storage_enabled";
+      return { candidates: [], diagnostics };
+    }
+    const profiles = buildConceptSearchProfiles(scopeAnalysis, filters);
+    diagnostics.profilesBuilt = profiles.length;
+    console.log("[EA Data] Concept solver profile build", {
+      stage: "concept",
+      action: "profile_build",
+      eligible: true,
+      failureShape: scopeAnalysis?.failureShape ?? null,
+      shortcomings: scopeAnalysis?.shortcomings ?? [],
+      scopeLocks: scopeAnalysis?.scopeLocks ?? [],
+      scopeRequirements: scopeAnalysis?.scopeRequirements ?? [],
+      profiles,
+    });
+    const ownedDefinitionIds = new Set(
+      (ownedPlayers ?? [])
+        .map((player) => player?.definitionId ?? null)
+        .filter((id) => id != null)
+        .map(String),
+    );
+    const keptDefinitionIds = new Set();
+    const candidateGroups = [];
+    for (const profile of profiles) {
+      const result = await fetchConceptCandidatesForProfile({
+        profile,
+        filters,
+        scopeAnalysis,
+        ownedDefinitionIds,
+        keptDefinitionIds,
+      });
+      diagnostics.profilesFetched += 1;
+      diagnostics.candidatesFetched += result.diagnostics.fetched;
+      diagnostics.candidatesKept += result.diagnostics.kept;
+      diagnostics.profileDiagnostics.push(result.diagnostics);
+      for (const [reason, count] of Object.entries(
+        result.diagnostics.rejectedByReason ?? {},
+      )) {
+        diagnostics.rejectedByReason[reason] =
+          (readNumeric(diagnostics.rejectedByReason[reason]) ?? 0) +
+          (readNumeric(count) ?? 0);
+      }
+      if (result.candidates.length) {
+        candidateGroups.push(result.candidates.slice());
+      }
+      console.log("[EA Data] Concept solver fetch", {
+        stage: "concept",
+        action: "fetch",
+        profile,
+        profileSummary: {
+          position: profile?.position ?? null,
+          level: profile?.level ?? null,
+          cardBucket: profile?.cardBucket ?? null,
+          rarityIds: profile?.rarityIds ?? [],
+          leagueId: profile?.leagueId ?? null,
+          nationId: profile?.nationId ?? null,
+          teamId: profile?.teamId ?? null,
+          requireBaseCard: Boolean(profile?.requireBaseCard),
+          allowTotwOrTots: Boolean(profile?.allowTotwOrTots),
+          reason: profile?.reason ?? null,
+          slotIndex: profile?.slotIndex ?? null,
+        },
+        fetched: result.diagnostics.fetched,
+        kept: result.diagnostics.kept,
+        keptSample: result.diagnostics.keptSample ?? [],
+        rejectedSample: result.diagnostics.rejectedSample ?? [],
+        rejectedByReason: result.diagnostics.rejectedByReason,
+        pages: result.diagnostics.pages,
+      });
+    }
+    const retryCandidateLimit = 240;
+    const candidates = [];
+    const queues = candidateGroups.map((group) => group.slice());
+    while (
+      candidates.length < retryCandidateLimit &&
+      queues.some((group) => group.length)
+    ) {
+      for (const group of queues) {
+        const next = group.shift();
+        if (!next) continue;
+        candidates.push(next);
+        if (candidates.length >= retryCandidateLimit) break;
+      }
+    }
+    diagnostics.retryPoolSelection = {
+      availableCandidates: candidateGroups.reduce(
+        (sum, group) => sum + group.length,
+        0,
+      ),
+      selectedCandidates: candidates.length,
+      candidateGroups: candidateGroups.length,
+      limit: retryCandidateLimit,
+    };
+    diagnostics.candidateSample = candidates.slice(0, 12).map((player) => ({
+      name: player?.name ?? null,
+      rating: player?.rating ?? null,
+      position:
+        player?.preferredPositionName ??
+        player?.preferredPosition ??
+        player?.position ??
+        null,
+      preferredPositionId: player?.preferredPositionId ?? null,
+      positions:
+        player?.alternativePositionNames ??
+        player?.basePossiblePositions ??
+        player?.positions ??
+        [],
+      positionIds:
+        player?.alternativePositionIds ?? player?.basePossiblePositions ?? [],
+      leagueId: player?.leagueId ?? null,
+      nationId: player?.nationId ?? null,
+      teamId: player?.teamId ?? null,
+      rarityId: player?.rarityId ?? null,
+      isSpecial: Boolean(player?.isSpecial),
+    }));
+    return { candidates, diagnostics };
+  };
+
+  const attachConceptDiagnostics = (result, diagnostics) => {
+    if (!result || typeof result !== "object") return result;
+    result.conceptDiagnostics = diagnostics;
+    if (!result.stats || typeof result.stats !== "object") result.stats = {};
+    result.stats.conceptDiagnostics = diagnostics;
+    return result;
+  };
+
+  const solveWithConceptFallback = async ({
+    payload,
+    players,
+    requirements,
+    requirementsNormalized,
+    requiredPlayers,
+    squadSlots,
+    prioritize,
+    filters,
+    debug = false,
+    playerById = null,
+    label = "solve",
+    timeoutMs = null,
+    onStatus = null,
+  }) => {
+    const baseResult = await callSolveBridge(
+      {
+        players,
+        _cacheRevision: payload?._cacheRevision ?? null,
+        requirements,
+        requirementsNormalized,
+        requiredPlayers,
+        squadSlots,
+        prioritize,
+        filters,
+        debug,
+      },
+      requirementsNormalized,
+      timeoutMs,
+    );
+    if (baseResult?.solutions?.length) return baseResult;
+
+    try {
+      onStatus?.({
+        phase: "concept_profile",
+        label: "Owned-player solve failed. Searching concept players...",
+      });
+    } catch {}
+    const { candidates, diagnostics } = await fetchConceptCandidatesForSolve({
+      ownedResult: baseResult,
+      ownedPlayers: players,
+      filters,
+    });
+    if (!candidates.length) return attachConceptDiagnostics(baseResult, diagnostics);
+
+    try {
+      onStatus?.({
+        phase: "concept_solve",
+        label: `Solving with concept fallback (${candidates.length} candidates)...`,
+      });
+    } catch {}
+    if (playerById && typeof playerById.set === "function") {
+      for (const player of candidates) {
+        if (player?.id == null) continue;
+        playerById.set(String(player.id), player);
+        playerById.set(player.id, player);
+      }
+    }
+
+    const retryResult = await callSolveBridge(
+      {
+        players: (Array.isArray(players) ? players : []).concat(candidates),
+        _cacheRevision: payload?._cacheRevision ?? null,
+        requirements,
+        requirementsNormalized,
+        requiredPlayers,
+        squadSlots,
+        prioritize,
+        filters: {
+          ...(filters && typeof filters === "object" ? filters : {}),
+          allowConceptPlayers: true,
+        },
+        debug,
+      },
+      requirementsNormalized,
+      timeoutMs,
+    );
+    attachConceptDiagnostics(retryResult, diagnostics);
+    const retryConceptCount =
+      readNumeric(retryResult?.stats?.conceptCount) ??
+      (Array.isArray(retryResult?.conceptPlayersUsed)
+        ? retryResult.conceptPlayersUsed.length
+        : 0);
+    if (retryResult && typeof retryResult === "object") {
+      retryResult.requiresConcepts = retryConceptCount > 0;
+      retryResult.submitReady = retryResult?.solved
+        ? retryConceptCount === 0
+        : false;
+      if (retryResult.stats && typeof retryResult.stats === "object") {
+        retryResult.stats.requiresConcepts = retryConceptCount > 0;
+        retryResult.stats.submitReady = retryResult?.solved
+          ? retryConceptCount === 0
+          : false;
+      }
+    }
+    diagnostics.retry = {
+      attempted: true,
+      solved: Boolean(retryResult?.solutions?.length),
+      submitReady:
+        retryResult?.submitReady ?? retryResult?.stats?.submitReady ?? null,
+      requiresConcepts: retryConceptCount > 0,
+      conceptCount: retryConceptCount,
+      conceptPlayersUsed:
+        retryResult?.conceptPlayersUsed ??
+        retryResult?.stats?.conceptPlayersUsed ??
+        [],
+      failingRequirements: retryResult?.failingRequirements ?? [],
+      chemistry: retryResult?.stats?.chemistry ?? null,
+      chemistryTargets: retryResult?.stats?.chemistryTargets ?? null,
+      squadRating: retryResult?.stats?.squadRating ?? null,
+      ratingTarget: retryResult?.stats?.ratingTarget ?? null,
+      solutionSlots: retryResult?.solutionSlots ?? [],
+      candidatesFetched: diagnostics?.candidatesFetched ?? 0,
+      candidatesKept: diagnostics?.candidatesKept ?? 0,
+      candidateSample: diagnostics?.candidateSample ?? [],
+      retryPoolConceptCandidates: candidates.length,
+      retryPoolSelection: diagnostics?.retryPoolSelection ?? null,
+    };
+    console.log("[EA Data] Concept solver retry summary", {
+      stage: "concept",
+      action: "retry_summary",
+      label,
+      ...diagnostics.retry,
+    });
+    if (retryResult?.solutions?.length) return retryResult;
+    return attachConceptDiagnostics(baseResult, diagnostics);
   };
 
   const LEAGUE_CONFLICT_GENERIC_TYPE_TOKENS = Object.freeze([
@@ -27849,11 +29652,7 @@
     }
     if (type === SOLVER_BRIDGE_TRACE) {
       if (source !== SOLVER_BRIDGE_SOURCE) return;
-      log("debug", "[EA Data] Solver bridge trace", {
-        stage: data?.stage,
-        requestId: data?.requestId,
-        details: data?.details ?? null,
-      });
+      logSolverBridgeTrace(data);
       return;
     }
     if (type === RES && requestId) {
@@ -27924,11 +29723,7 @@
     const detail = event.detail;
     if (!detail) return;
     if (detail?.source !== SOLVER_BRIDGE_SOURCE) return;
-    log("debug", "[EA Data] Solver bridge trace", {
-      stage: detail.stage,
-      requestId: detail.requestId,
-      details: detail.details ?? null,
-    });
+    logSolverBridgeTrace(detail);
   });
 
   try {

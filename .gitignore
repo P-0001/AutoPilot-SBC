@@ -4,6 +4,7 @@ Thumbs.db
 *.log
 *.tmp
 *.swp
+*.mjs
 .vscode/
 .idea/
 
@@ -14,6 +15,7 @@ scripts/
 data/*
 !data/changelog.json
 tampermonkey/*
+futbin-challenges-raw-2026-05-14T21-10-47-029Z.json
 
 # Local planning / scratch notes
 findings.md
